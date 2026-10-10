@@ -5,9 +5,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Bot, InlineKeyboard } from 'grammy';
 
+pg.types.setTypeParser(1700, (v) => parseFloat(v)); // NUMERIC -> number
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
+const CHANNEL = (process.env.CHANNEL || '').trim().replace(/^https?:\/\/t\.me\//, '').replace(/^@/, '');
 const SHOP_NAME = process.env.SHOP_NAME || 'SAZY SHOP';
 const DEV_USER_ID = process.env.DEV_USER_ID ? Number(process.env.DEV_USER_ID) : null;
 const PORT = process.env.PORT || 3000;
@@ -26,11 +29,13 @@ async function initDb() {
   await q(`
     CREATE TABLE IF NOT EXISTS categories ( id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE );
     CREATE TABLE IF NOT EXISTS images ( id SERIAL PRIMARY KEY, mime TEXT NOT NULL, data BYTEA NOT NULL );
-    CREATE TABLE IF NOT EXISTS products ( id SERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL DEFAULT 0, category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL, image_ids INTEGER[] NOT NULL DEFAULT '{}', in_stock BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now() );
+    CREATE TABLE IF NOT EXISTS products ( id SERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', price NUMERIC(10,2) NOT NULL DEFAULT 0, category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL, image_ids INTEGER[] NOT NULL DEFAULT '{}', in_stock BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now() );
     CREATE TABLE IF NOT EXISTS favorites ( user_id BIGINT NOT NULL, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, PRIMARY KEY (user_id, product_id) );
     CREATE TABLE IF NOT EXISTS cart_items ( user_id BIGINT NOT NULL, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE, PRIMARY KEY (user_id, product_id) );
     CREATE TABLE IF NOT EXISTS orders ( id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, username TEXT, name TEXT NOT NULL, phone TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '', items JSONB NOT NULL, total INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'new', created_at TIMESTAMPTZ NOT NULL DEFAULT now() );
   `);
+  await q('ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(10,2)');
+  await q('ALTER TABLE orders ALTER COLUMN total TYPE NUMERIC(10,2)');
 }
 
 function validateInitData(initData) {
@@ -68,6 +73,28 @@ const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e);
 const app = express();
 app.disable('x-powered-by');
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ---- avatar from the Telegram channel (set CHANNEL=username in Railway) ----
+let avatarCache = { at: 0, buf: null };
+app.get('/avatar.jpg', wrap(async (_req, res) => {
+  if (!CHANNEL || !BOT_TOKEN) return res.status(404).end();
+  if (!avatarCache.buf || Date.now() - avatarCache.at > 6 * 3600 * 1000) {
+    try {
+      const chat = await bot.api.getChat('@' + CHANNEL);
+      if (!chat.photo) return res.status(404).end();
+      const file = await bot.api.getFile(chat.photo.big_file_id);
+      const r = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+      avatarCache = { at: Date.now(), buf: Buffer.from(await r.arrayBuffer()) };
+    } catch (e) {
+      console.error('avatar', e.message);
+      if (!avatarCache.buf) return res.status(404).end();
+    }
+  }
+  res.set('Content-Type', 'image/jpeg');
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.send(avatarCache.buf);
+}));
+
 app.get('/health', (_req, res) => res.send('ok'));
 
 app.get('/img/:id', wrap(async (req, res) => {
@@ -92,7 +119,7 @@ const mapProduct = (p) => ({
   fav: !!p.fav, in_cart: !!p.in_cart,
 });
 
-app.get('/api/config', (_req, res) => res.json({ shopName: SHOP_NAME }));
+app.get('/api/config', (_req, res) => res.json({ shopName: SHOP_NAME, avatar: !!CHANNEL }));
 app.get('/api/me', auth, (req, res) => res.json({
   id: req.user.id, name: [req.user.first_name, req.user.last_name].filter(Boolean).join(' '),
   username: req.user.username || null, isAdmin: req.isAdmin,
@@ -137,7 +164,7 @@ app.get('/api/cart', auth, wrap(async (req, res) => {
 }));
 app.post('/api/cart/:id', auth, wrap(async (req, res) => {
   const { rows } = await q('SELECT in_stock FROM products WHERE id=$1', [Number(req.params.id)]);
-  if (!rows.length || !rows[0].in_stock) return res.status(400).json({ error: 'Товар недоступен' });
+  if (!rows.length || !rows[0].in_stock) return res.status(400).json({ error: 'Ð¢Ð¾Ð²Ð°Ñ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½' });
   await q('INSERT INTO cart_items(user_id, product_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, Number(req.params.id)]);
   res.json({ ok: true });
 }));
@@ -151,7 +178,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
   const name = clean(req.body.name, 100);
   const phone = clean(req.body.phone, 40);
   const comment = clean(req.body.comment, 500);
-  if (!name || !phone) return res.status(400).json({ error: 'Укажите имя и телефон' });
+  if (!name || !phone) return res.status(400).json({ error: 'Ð£ÐºÐ°Ð¶Ð¸ÑÐµ Ð¸Ð¼Ñ Ð¸ ÑÐµÐ»ÐµÑÐ¾Ð½' });
   
   const client = await pool.connect();
   let order;
@@ -161,16 +188,16 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
       `SELECT p.id, p.title, p.price FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.user_id=$1 AND p.in_stock=TRUE FOR UPDATE OF p`,
       [req.user.id]
     );
-    if (!items.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Корзина пуста или товары уже проданы' }); }
+    if (!items.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'ÐÐ¾ÑÐ·Ð¸Ð½Ð° Ð¿ÑÑÑÐ° Ð¸Ð»Ð¸ ÑÐ¾Ð²Ð°ÑÑ ÑÐ¶Ðµ Ð¿ÑÐ¾Ð´Ð°Ð½Ñ' }); }
     
-    const total = items.reduce((s, i) => s + i.price, 0);
+    const total = Math.round(items.reduce((s, i) => s + i.price, 0) * 100) / 100;
     const ins = await client.query(
       `INSERT INTO orders(user_id, username, name, phone, comment, items, total) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
       [req.user.id, req.user.username || null, name, phone, comment, JSON.stringify(items), total]
     );
     order = ins.rows[0];
     
-    // УБРАЛИ АВТОМАТИЧЕСКОЕ СНЯТИЕ С ПРОДАЖИ
+    // Ð£ÐÐ ÐÐÐ ÐÐÐ¢ÐÐÐÐ¢ÐÐ§ÐÐ¡ÐÐÐ Ð¡ÐÐ¯Ð¢ÐÐ Ð¡ ÐÐ ÐÐÐÐÐ
     // await client.query('UPDATE products SET in_stock=FALSE WHERE id = ANY($1::int[])', [items.map((i) => i.id)]);
     
     await client.query('DELETE FROM cart_items WHERE user_id=$1', [req.user.id]);
@@ -206,9 +233,9 @@ app.put('/api/admin/orders/:id/status', auth, adminOnly, wrap(async (req, res) =
   await q('UPDATE orders SET status=$1 WHERE id=$2', [status, order.id]);
   if (bot) {
     const text = {
-      confirmed: `Ваш заказ №${order.id} подтверждён ✅`,
-      done: `Заказ №${order.id} выполнен. Спасибо за покупку! 🙌`,
-      cancelled: `Заказ №${order.id} отменён.`,
+      confirmed: `ÐÐ°Ñ Ð·Ð°ÐºÐ°Ð· â${order.id} Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ â`,
+      done: `ÐÐ°ÐºÐ°Ð· â${order.id} Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½. Ð¡Ð¿Ð°ÑÐ¸Ð±Ð¾ Ð·Ð° Ð¿Ð¾ÐºÑÐ¿ÐºÑ! ð`,
+      cancelled: `ÐÐ°ÐºÐ°Ð· â${order.id} Ð¾ÑÐ¼ÐµÐ½ÑÐ½.`,
     }[status];
     if (text) bot.api.sendMessage(order.user_id, text).catch(() => {});
   }
@@ -228,7 +255,7 @@ app.delete('/api/admin/categories/:id', auth, adminOnly, wrap(async (req, res) =
 
 function parseProduct(body) {
   const title = clean(body.title, 150);
-  const price = Math.max(0, Math.round(Number(body.price) || 0));
+  const price = Math.max(0, Math.round((Number(String(body.price).replace(',', '.')) || 0) * 100) / 100);
   if (!title) return null;
   return {
     title, description: clean(body.description, 3000), price,
@@ -261,9 +288,9 @@ app.delete('/api/admin/products/:id', auth, adminOnly, wrap(async (req, res) => 
 let bot = null;
 async function notifyAdmins(order) {
   if (!bot || !ADMIN_IDS.length) return;
-  const lines = order.items.map((i) => `• ${i.title} — ${i.price} ₽`).join('\n');
+  const lines = order.items.map((i) => `â¢ ${i.title} â ${i.price} BYN`).join('\n');
   const contact = order.username ? `@${order.username}` : `tg://user?id=${order.user_id}`;
-  const text = `🛒 Новый заказ №${order.id}\n\n${lines}\n\nИтого: ${order.total} ₽\n\nИмя: ${order.name}\nТелефон: ${order.phone}\nTelegram: ${contact}` + (order.comment ? `\nКомментарий: ${order.comment}` : '');
+  const text = `ð ÐÐ¾Ð²ÑÐ¹ Ð·Ð°ÐºÐ°Ð· â${order.id}\n\n${lines}\n\nÐÑÐ¾Ð³Ð¾: ${order.total} BYN\n\nÐÐ¼Ñ: ${order.name}\nÐ¢ÐµÐ»ÐµÑÐ¾Ð½: ${order.phone}\nTelegram: ${contact}` + (order.comment ? `\nÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹: ${order.comment}` : '');
   await Promise.allSettled(ADMIN_IDS.map((id) => bot.api.sendMessage(id, text)));
 }
 
@@ -271,12 +298,12 @@ async function startBot() {
   if (!BOT_TOKEN) { console.warn('BOT_TOKEN not set, bot disabled (DEV mode)'); return; }
   bot = new Bot(BOT_TOKEN);
   bot.command('start', (ctx) => {
-    if (!WEBAPP_URL) return ctx.reply('WEBAPP_URL не задан.');
-    return ctx.reply(`Добро пожаловать в ${SHOP_NAME}!`, { reply_markup: new InlineKeyboard().webApp('🛍 Открыть магазин', WEBAPP_URL) });
+    if (!WEBAPP_URL) return ctx.reply('WEBAPP_URL Ð½Ðµ Ð·Ð°Ð´Ð°Ð½.');
+    return ctx.reply(`ÐÐ¾Ð±ÑÐ¾ Ð¿Ð¾Ð¶Ð°Ð»Ð¾Ð²Ð°ÑÑ Ð² ${SHOP_NAME}!`, { reply_markup: new InlineKeyboard().webApp('ð ÐÑÐºÑÑÑÑ Ð¼Ð°Ð³Ð°Ð·Ð¸Ð½', WEBAPP_URL) });
   });
   bot.catch((e) => console.error('bot error', e.message));
   if (WEBAPP_URL) {
-    bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'Магазин', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
+    bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'ÐÐ°Ð³Ð°Ð·Ð¸Ð½', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
   }
   bot.start({ drop_pending_updates: true }).catch((e) => console.error('bot stopped', e.message));
 }
