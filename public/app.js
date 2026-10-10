@@ -54,10 +54,7 @@ function closeSheet() { $('#sheetRoot').innerHTML = ''; }
 function setBadge(n) {
   S.cartCount = n;
   const b = $('#badge');
-  if(b) {
-    b.hidden = !n;
-    b.textContent = n;
-  }
+  if (b) { b.hidden = !n; b.textContent = n; }
 }
 
 async function refreshBadge() {
@@ -240,7 +237,7 @@ async function viewCart() {
     try {
       const r = await api('/orders', 'POST', { name, phone, comment: $('#ocomment').value });
       setBadge(0);
-      $('#view').innerHTML = `<div class="empty"><div style="font-size:56px;margin-bottom:10px">🎉</div><h2 style="margin-bottom:8px">Заказ №${r.id} оформлен</h2><p style="color:var(--muted)">Мы свяжемся с вами в ближайшее время.</p></div>`;
+      $('#view').innerHTML = `<div class="empty"><div style="font-size:56px;margin-bottom:10px"></div><h2 style="margin-bottom:8px">Заказ №${r.id} оформлен</h2><p style="color:var(--muted)">Мы свяжемся с вами в ближайшее время.</p></div>`;
       tg?.HapticFeedback?.notificationOccurred?.('success');
     } catch (err) { toast(err.message); e.target.disabled = false; }
   };
@@ -441,7 +438,13 @@ document.querySelectorAll('#nav button').forEach((b) => (b.onclick = () => {
     document.title = cfg.shopName;
     
     const adminBtn = document.querySelector('#nav button[data-tab="admin"]');
-    if(adminBtn) adminBtn.hidden = !me.isAdmin;
+    if (adminBtn) {
+      if (me.isAdmin) {
+        adminBtn.removeAttribute('hidden');
+      } else {
+        adminBtn.setAttribute('hidden', '');
+      }
+    }
 
     refreshBadge();
     render();
