@@ -72,7 +72,14 @@ const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e);
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res, file) => {
+    if (file.endsWith('.js')) res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    else if (file.endsWith('.css')) res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    else if (file.endsWith('.html')) res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+  },
+}));
 
 // ---- avatar from the Telegram channel (set CHANNEL=username in Railway) ----
 let avatarCache = { at: 0, buf: null };
@@ -164,7 +171,7 @@ app.get('/api/cart', auth, wrap(async (req, res) => {
 }));
 app.post('/api/cart/:id', auth, wrap(async (req, res) => {
   const { rows } = await q('SELECT in_stock FROM products WHERE id=$1', [Number(req.params.id)]);
-  if (!rows.length || !rows[0].in_stock) return res.status(400).json({ error: 'Ð¢Ð¾Ð²Ð°Ñ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½' });
+  if (!rows.length || !rows[0].in_stock) return res.status(400).json({ error: 'Товар недоступен' });
   await q('INSERT INTO cart_items(user_id, product_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, Number(req.params.id)]);
   res.json({ ok: true });
 }));
@@ -178,7 +185,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
   const name = clean(req.body.name, 100);
   const phone = clean(req.body.phone, 40);
   const comment = clean(req.body.comment, 500);
-  if (!name || !phone) return res.status(400).json({ error: 'Ð£ÐºÐ°Ð¶Ð¸ÑÐµ Ð¸Ð¼Ñ Ð¸ ÑÐµÐ»ÐµÑÐ¾Ð½' });
+  if (!name || !phone) return res.status(400).json({ error: 'Укажите имя и телефон' });
   
   const client = await pool.connect();
   let order;
@@ -188,7 +195,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
       `SELECT p.id, p.title, p.price FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.user_id=$1 AND p.in_stock=TRUE FOR UPDATE OF p`,
       [req.user.id]
     );
-    if (!items.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'ÐÐ¾ÑÐ·Ð¸Ð½Ð° Ð¿ÑÑÑÐ° Ð¸Ð»Ð¸ ÑÐ¾Ð²Ð°ÑÑ ÑÐ¶Ðµ Ð¿ÑÐ¾Ð´Ð°Ð½Ñ' }); }
+    if (!items.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Корзина пуста или товары уже проданы' }); }
     
     const total = Math.round(items.reduce((s, i) => s + i.price, 0) * 100) / 100;
     const ins = await client.query(
@@ -197,7 +204,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
     );
     order = ins.rows[0];
     
-    // Ð£ÐÐ ÐÐÐ ÐÐÐ¢ÐÐÐÐ¢ÐÐ§ÐÐ¡ÐÐÐ Ð¡ÐÐ¯Ð¢ÐÐ Ð¡ ÐÐ ÐÐÐÐÐ
+    // УБРАЛИ АВТОМАТИЧЕСКОЕ СНЯТИЕ С ПРОДАЖИ
     // await client.query('UPDATE products SET in_stock=FALSE WHERE id = ANY($1::int[])', [items.map((i) => i.id)]);
     
     await client.query('DELETE FROM cart_items WHERE user_id=$1', [req.user.id]);
@@ -233,9 +240,9 @@ app.put('/api/admin/orders/:id/status', auth, adminOnly, wrap(async (req, res) =
   await q('UPDATE orders SET status=$1 WHERE id=$2', [status, order.id]);
   if (bot) {
     const text = {
-      confirmed: `ÐÐ°Ñ Ð·Ð°ÐºÐ°Ð· â${order.id} Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ â`,
-      done: `ÐÐ°ÐºÐ°Ð· â${order.id} Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½. Ð¡Ð¿Ð°ÑÐ¸Ð±Ð¾ Ð·Ð° Ð¿Ð¾ÐºÑÐ¿ÐºÑ! ð`,
-      cancelled: `ÐÐ°ÐºÐ°Ð· â${order.id} Ð¾ÑÐ¼ÐµÐ½ÑÐ½.`,
+      confirmed: `Ваш заказ №${order.id} подтверждён ✅`,
+      done: `Заказ №${order.id} выполнен. Спасибо за покупку! 🙌`,
+      cancelled: `Заказ №${order.id} отменён.`,
     }[status];
     if (text) bot.api.sendMessage(order.user_id, text).catch(() => {});
   }
@@ -288,9 +295,9 @@ app.delete('/api/admin/products/:id', auth, adminOnly, wrap(async (req, res) => 
 let bot = null;
 async function notifyAdmins(order) {
   if (!bot || !ADMIN_IDS.length) return;
-  const lines = order.items.map((i) => `â¢ ${i.title} â ${i.price} BYN`).join('\n');
+  const lines = order.items.map((i) => `• ${i.title} — ${i.price} BYN`).join('\n');
   const contact = order.username ? `@${order.username}` : `tg://user?id=${order.user_id}`;
-  const text = `ð ÐÐ¾Ð²ÑÐ¹ Ð·Ð°ÐºÐ°Ð· â${order.id}\n\n${lines}\n\nÐÑÐ¾Ð³Ð¾: ${order.total} BYN\n\nÐÐ¼Ñ: ${order.name}\nÐ¢ÐµÐ»ÐµÑÐ¾Ð½: ${order.phone}\nTelegram: ${contact}` + (order.comment ? `\nÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹: ${order.comment}` : '');
+  const text = `🛒 Новый заказ №${order.id}\n\n${lines}\n\nИтого: ${order.total} BYN\n\nИмя: ${order.name}\nТелефон: ${order.phone}\nTelegram: ${contact}` + (order.comment ? `\nКомментарий: ${order.comment}` : '');
   await Promise.allSettled(ADMIN_IDS.map((id) => bot.api.sendMessage(id, text)));
 }
 
@@ -298,12 +305,12 @@ async function startBot() {
   if (!BOT_TOKEN) { console.warn('BOT_TOKEN not set, bot disabled (DEV mode)'); return; }
   bot = new Bot(BOT_TOKEN);
   bot.command('start', (ctx) => {
-    if (!WEBAPP_URL) return ctx.reply('WEBAPP_URL Ð½Ðµ Ð·Ð°Ð´Ð°Ð½.');
-    return ctx.reply(`ÐÐ¾Ð±ÑÐ¾ Ð¿Ð¾Ð¶Ð°Ð»Ð¾Ð²Ð°ÑÑ Ð² ${SHOP_NAME}!`, { reply_markup: new InlineKeyboard().webApp('ð ÐÑÐºÑÑÑÑ Ð¼Ð°Ð³Ð°Ð·Ð¸Ð½', WEBAPP_URL) });
+    if (!WEBAPP_URL) return ctx.reply('WEBAPP_URL не задан.');
+    return ctx.reply(`Добро пожаловать в ${SHOP_NAME}!`, { reply_markup: new InlineKeyboard().webApp('🛍 Открыть магазин', WEBAPP_URL) });
   });
   bot.catch((e) => console.error('bot error', e.message));
   if (WEBAPP_URL) {
-    bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'ÐÐ°Ð³Ð°Ð·Ð¸Ð½', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
+    bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'Магазин', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
   }
   bot.start({ drop_pending_updates: true }).catch((e) => console.error('bot stopped', e.message));
 }
