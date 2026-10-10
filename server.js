@@ -7,7 +7,6 @@ import { Bot, InlineKeyboard } from 'grammy';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOT_TOKEN = process.env.BOT_TOKEN;
-// ВАЖНО: Укажи свой Telegram ID в переменных окружения (ADMIN_IDS)
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
 const SHOP_NAME = process.env.SHOP_NAME || 'SAZY SHOP';
 const DEV_USER_ID = process.env.DEV_USER_ID ? Number(process.env.DEV_USER_ID) : null;
@@ -34,7 +33,6 @@ async function initDb() {
   `);
 }
 
-// ---------- Telegram initData validation ----------
 function validateInitData(initData) {
   if (!initData || !BOT_TOKEN) return null;
   const params = new URLSearchParams(initData);
@@ -67,7 +65,6 @@ function adminOnly(req, res, next) {
 
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: 'server error' }); });
 
-// ---------- App ----------
 const app = express();
 app.disable('x-powered-by');
 app.use(express.static(path.join(__dirname, 'public')));
@@ -121,7 +118,6 @@ app.get('/api/products', auth, wrap(async (req, res) => {
   res.json(rows.map(mapProduct));
 }));
 
-// favorites
 app.post('/api/favorites/:id', auth, wrap(async (req, res) => {
   await q('INSERT INTO favorites(user_id, product_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, Number(req.params.id)]);
   res.json({ ok: true });
@@ -131,7 +127,6 @@ app.delete('/api/favorites/:id', auth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// cart
 app.get('/api/cart', auth, wrap(async (req, res) => {
   const { rows } = await q(
     `SELECT p.*, c.name AS category, TRUE AS in_cart, EXISTS(SELECT 1 FROM favorites f WHERE f.user_id=$1 AND f.product_id=p.id) AS fav 
@@ -151,7 +146,6 @@ app.delete('/api/cart/:id', auth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// orders
 const clean = (v, n) => String(v || '').trim().slice(0, n);
 app.post('/api/orders', auth, wrap(async (req, res) => {
   const name = clean(req.body.name, 100);
@@ -176,14 +170,10 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
     );
     order = ins.rows[0];
     
-    // УБРАЛИ АВТОМАТИЧЕСКОЕ СНЯТИЕ С ПРОДАЖИ:
+    // УБРАЛИ АВТОМАТИЧЕСКОЕ СНЯТИЕ С ПРОДАЖИ
     // await client.query('UPDATE products SET in_stock=FALSE WHERE id = ANY($1::int[])', [items.map((i) => i.id)]);
     
     await client.query('DELETE FROM cart_items WHERE user_id=$1', [req.user.id]);
-    
-    // УБРАЛИ АВТОМАТИЧЕСКОЕ УДАЛЕНИЕ ИЗ КОРЗИН ДРУГИХ ЛЮДЕЙ:
-    // await client.query('DELETE FROM cart_items WHERE product_id = ANY($1::int[])', [items.map((i) => i.id)]);
-    
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -200,7 +190,6 @@ app.get('/api/orders', auth, wrap(async (req, res) => {
   res.json(rows);
 }));
 
-// ---------- Admin ----------
 app.get('/api/admin/orders', auth, adminOnly, wrap(async (req, res) => {
   const status = req.query.status;
   const { rows } = await q(`SELECT * FROM orders WHERE ($1::text IS NULL OR status=$1) ORDER BY id DESC LIMIT 200`, [status || null]);
@@ -214,9 +203,6 @@ app.put('/api/admin/orders/:id/status', auth, adminOnly, wrap(async (req, res) =
   const { rows } = await q('SELECT * FROM orders WHERE id=$1', [Number(req.params.id)]);
   if (!rows.length) return res.status(404).json({ error: 'not found' });
   const order = rows[0];
-  
-  // УБРАЛИ АВТОМАТИЧЕСКОЕ ВОЗВРАЩЕНИЕ/СНЯТИЕ ТОВАРОВ ПРИ СМЕНЕ СТАТУСА ЗАКАЗА
-  
   await q('UPDATE orders SET status=$1 WHERE id=$2', [status, order.id]);
   if (bot) {
     const text = {
@@ -272,7 +258,6 @@ app.delete('/api/admin/products/:id', auth, adminOnly, wrap(async (req, res) => 
   res.json({ ok: true });
 }));
 
-// ---------- Bot ----------
 let bot = null;
 async function notifyAdmins(order) {
   if (!bot || !ADMIN_IDS.length) return;
