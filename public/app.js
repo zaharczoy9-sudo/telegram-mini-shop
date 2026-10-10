@@ -64,7 +64,6 @@ async function refreshBadge() {
   try { setBadge((await api('/cart')).length); } catch {}
 }
 
-// ---------- Catalog ----------
 function cardHtml(p) {
   const img = p.images[0] ? `<img loading="lazy" src="${p.images[0]}" alt="">` : '';
   return `<div class="card" data-id="${p.id}">
@@ -96,7 +95,6 @@ function renderGrid(list, emptyText) {
 }
 
 async function viewCatalog() {
-  // Новая шапка с логотипом
   $('#top').innerHTML = `
     <div class="header-row">
       <div class="logo">S</div>
@@ -152,11 +150,10 @@ async function viewFavs() {
   $('#top').innerHTML = '<h1 class="title">Избранное</h1>';
   $('#view').innerHTML = '<div class="grid" id="grid"></div>';
   const prevQ = S.q; S.q = '';
-  renderGrid(await loadProducts(true), 'Здесь пока пусто. <br>Нажмите ♡ на понравившемся товаре');
+  renderGrid(await loadProducts(true), 'Здесь пока пусто. Нажмите ♡ на понравившемся товаре');
   S.q = prevQ;
 }
 
-// card actions
 document.addEventListener('click', async (e) => {
   const act = e.target.closest('[data-act]');
   const card = e.target.closest('.card');
@@ -205,7 +202,6 @@ function openProduct(p) {
   );
 }
 
-// ---------- Cart ----------
 async function viewCart() {
   $('#top').innerHTML = '<h1 class="title">Корзина</h1>';
   const items = await api('/cart');
@@ -250,7 +246,6 @@ async function viewCart() {
   };
 }
 
-// ---------- Profile ----------
 const STATUS_RU = { new: 'Новый', confirmed: 'Подтверждён', done: 'Выполнен', cancelled: 'Отменён' };
 const fmtDate = (d) => new Date(d).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 
@@ -283,7 +278,6 @@ async function viewProfile() {
   `;
 }
 
-// ---------- Admin ----------
 async function viewAdmin() {
   $('#top').innerHTML = '<h1 class="title">Админ-панель</h1>';
   const v = $('#view');
@@ -422,7 +416,6 @@ async function adminCats(body) {
   }));
 }
 
-// ---------- Router ----------
 async function render() {
   document.querySelectorAll('#nav button').forEach((b) => b.classList.toggle('on', b.dataset.tab === S.tab));
   window.scrollTo(0, 0);
@@ -447,7 +440,6 @@ document.querySelectorAll('#nav button').forEach((b) => (b.onclick = () => {
     S.shopName = cfg.shopName; S.me = me; S.cats = cats;
     document.title = cfg.shopName;
     
-    // Скрываем админку, если юзер не админ
     const adminBtn = document.querySelector('#nav button[data-tab="admin"]');
     if(adminBtn) adminBtn.hidden = !me.isAdmin;
 
