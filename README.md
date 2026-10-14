@@ -1,4 +1,4 @@
-# SAZY SHOP — аукцион в Telegram
+# LOT24 — аукцион в Telegram
 
 Мини-приложение: пользователи выставляют вещи на аукцион на 24 часа, остальные делают ставки.
 Стек: Node.js, Express, PostgreSQL, grammY. Деплой: GitHub + Railway.

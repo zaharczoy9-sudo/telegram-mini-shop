@@ -13,7 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ---------- config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
-const SHOP_NAME = process.env.SHOP_NAME || 'SAZY SHOP';
+const SHOP_NAME = process.env.SHOP_NAME || 'LOT24';
 const CHANNEL = (process.env.CHANNEL || '').trim().replace(/^https?:\/\/t\.me\//, '').replace(/^@/, '');
 const DEV_USER_ID = process.env.DEV_USER_ID ? Number(process.env.DEV_USER_ID) : null;
 const PORT = process.env.PORT || 3000;
