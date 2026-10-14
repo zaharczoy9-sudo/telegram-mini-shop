@@ -1,6 +1,7 @@
 const tg = window.Telegram?.WebApp;
 tg?.ready();
 tg?.expand();
+try { tg?.setHeaderColor?.('#150b2e'); tg?.setBackgroundColor?.('#150b2e'); tg?.setBottomBarColor?.('#1b1038'); } catch {}
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -10,7 +11,7 @@ const r2 = (n) => Math.round(n * 100) / 100;
 const S = {
   tab: 'catalog',
   me: null,
-  cfg: { shopName: 'SAZY SHOP', hours: 24, maxStep: 10, fees: { listingStars: 50, listingByn: 3, bumpStars: 25 } },
+  cfg: { shopName: 'LOT24', hours: 24, maxStep: 10, fees: { listingStars: 50, listingByn: 3, bumpStars: 25 } },
   q: '',
   sort: 'bump',
   off: 0, // server time offset, ms
@@ -163,9 +164,9 @@ function renderGrid(list, emptyText) {
 
 async function viewCatalog() {
   $('#top').innerHTML = `
-    <div class="header-row">
-      <div class="logo">${S.cfg.avatar ? '<img src="/avatar.jpg" alt="" onerror="this.remove()">' : ''}${esc((S.cfg.shopName || 'S')[0])}</div>
-      <h1 class="title">${esc(S.cfg.shopName)}</h1>
+    <div class="header-row brand">
+      <div class="logo"><img src="${S.cfg.avatar ? '/avatar.jpg' : '/logo.png'}" alt="" onerror="this.onerror=null;this.src='/logo.png'"></div>
+      <div><h1 class="title">${esc(S.cfg.shopName)}</h1><div class="sub">аукцион · ${S.cfg.hours} часа</div></div>
     </div>
     <div class="row">
       <label class="search">${ICON.search}<input id="q" placeholder="Найти лот..." value="${esc(S.q)}"></label>
