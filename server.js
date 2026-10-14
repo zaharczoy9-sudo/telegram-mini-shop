@@ -3,7 +3,7 @@ import pg from 'pg';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, InputFile } from 'grammy';
 
 pg.types.setTypeParser(1700, (v) => parseFloat(v)); // NUMERIC -> number
 pg.types.setTypeParser(20, (v) => Number(v)); // BIGINT -> number
@@ -256,7 +256,7 @@ app.use('/api', express.json({ limit: '1mb' }));
 
 app.get('/api/config', (_req, res) => res.json({
   shopName: SHOP_NAME,
-  avatar: !!CHANNEL,
+  avatar: process.env.AVATAR_FROM_CHANNEL === 'true' && !!CHANNEL, // по умолчанию в шапке логотип LOT24
   hours: AUCTION_HOURS,
   maxStep: MAX_STEP,
   freeListing: FREE_LISTING,
@@ -525,12 +525,57 @@ async function startBot() {
   if (!BOT_TOKEN) { console.warn('BOT_TOKEN not set, bot disabled (DEV mode)'); return; }
   bot = new Bot(BOT_TOKEN);
 
-  bot.command('start', (ctx) => {
-    if (!WEBAPP_URL) return ctx.reply('WEBAPP_URL не задан.');
-    return ctx.reply(`Добро пожаловать в ${SHOP_NAME}! Здесь можно выставлять вещи на аукцион и делать ставки.`, {
-      reply_markup: new InlineKeyboard().webApp('Открыть аукцион', WEBAPP_URL),
-    });
+  const welcomeText = () =>
+    `<b>Добро пожаловать в ${h(SHOP_NAME)}!</b> 👋\n\n` +
+    `Аукцион вещей прямо в Telegram.\n\n` +
+    `🔨 Выставляйте свои вещи${FREE_LISTING ? ' — размещение <b>бесплатно</b> (акция к открытию)' : ''}\n` +
+    `⏱ Торги длятся <b>${AUCTION_HOURS} часа</b>\n` +
+    `💸 Делайте ставки и выигрывайте лоты\n` +
+    `🤝 Победитель и продавец договариваются о личной встрече\n\n` +
+    `Нажмите кнопку ниже, чтобы открыть аукцион 👇`;
+
+  const helpText = () =>
+    `<b>Как это работает</b>\n\n` +
+    `<b>Выставить лот</b>\nВкладка «Выставить»: фото, название, размер, стартовая цена, шаг ставки, город для встречи и ваш контакт.${FREE_LISTING ? ' Размещение бесплатно.' : ` Размещение — ${LISTING_STARS} ⭐ или ${fmt(LISTING_BYN)} BYN.`}\n\n` +
+    `<b>Сделать ставку</b>\nОткройте лот и выберите сумму. Шаг ставки — от минимального шага лота до ${fmt(MAX_STEP)} BYN. Если вас перебьют, бот пришлёт уведомление.\n\n` +
+    `<b>Итоги</b>\nЧерез ${AUCTION_HOURS} ч торги закрываются. Победитель получит контакт владельца и город, продавец — профиль победителя.\n\n` +
+    `<b>Поднять лот</b>\nЗа ${BUMP_STARS} ⭐ лот окажется в начале списка.\n\n` +
+    `<b>Безопасность</b>\nВстречайтесь в людных местах, осматривайте вещь перед оплатой и не переводите предоплату незнакомым людям.`;
+
+  const startKb = () => {
+    const kb = new InlineKeyboard();
+    if (WEBAPP_URL) kb.webApp('🔨 Открыть аукцион', WEBAPP_URL).row();
+    kb.text('ℹ️ Как это работает', 'how');
+    if (CHANNEL) kb.row().url('📣 Наш канал', `https://t.me/${CHANNEL}`);
+    return kb;
+  };
+
+  let welcomePhotoId = null; // кэшируем file_id, чтобы не загружать картинку каждый раз
+  bot.command('start', async (ctx) => {
+    const opts = { caption: welcomeText(), parse_mode: 'HTML', reply_markup: startKb() };
+    try {
+      if (welcomePhotoId) return await ctx.replyWithPhoto(welcomePhotoId, opts);
+      const msg = await ctx.replyWithPhoto(new InputFile(path.join(__dirname, 'public', 'welcome.jpg')), opts);
+      welcomePhotoId = msg.photo?.[msg.photo.length - 1]?.file_id || null;
+    } catch (e) {
+      console.error('welcome photo', e.message);
+      await ctx.reply(welcomeText(), { parse_mode: 'HTML', reply_markup: startKb() });
+    }
   });
+
+  bot.command('help', (ctx) => ctx.reply(helpText(), { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }));
+  bot.callbackQuery('how', async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.reply(helpText(), { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+  });
+
+  // описание бота (видно до нажатия START) и меню команд
+  bot.api.setMyDescription(`${SHOP_NAME} — аукцион вещей в Telegram. Выставляйте лоты, делайте ставки, торги длятся ${AUCTION_HOURS} часа. Нажмите START!`).catch((e) => console.error('description', e.message));
+  bot.api.setMyShortDescription(`Аукцион вещей: выставляйте лоты и делайте ставки. Торги ${AUCTION_HOURS} часа 🔨`).catch((e) => console.error('short description', e.message));
+  bot.api.setMyCommands([
+    { command: 'start', description: 'Открыть аукцион' },
+    { command: 'help', description: 'Как это работает' },
+  ]).catch((e) => console.error('commands', e.message));
 
   bot.on('pre_checkout_query', async (ctx) => {
     try {
@@ -581,7 +626,7 @@ async function startBot() {
   if (WEBAPP_URL) {
     bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'Аукцион', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
   }
-  bot.start({ drop_pending_updates: false, allowed_updates: ['message', 'pre_checkout_query'] }).catch((e) => console.error('bot stopped', e.message));
+  bot.start({ drop_pending_updates: false, allowed_updates: ['message', 'callback_query', 'pre_checkout_query'] }).catch((e) => console.error('bot stopped', e.message));
 }
 
 await initDb();
