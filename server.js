@@ -11,21 +11,32 @@ pg.types.setTypeParser(20, (v) => Number(v)); // BIGINT -> number
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------- config ----------
+const numOr = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
 const SHOP_NAME = process.env.SHOP_NAME || 'LOT24';
 const CHANNEL = (process.env.CHANNEL || '').trim().replace(/^https?:\/\/t\.me\//, '').replace(/^@/, '');
+// куда постить новые лоты: числовой CHANNEL_ID (для приватных каналов) или @username из CHANNEL
+const CHANNEL_CHAT = process.env.CHANNEL_ID ? Number(process.env.CHANNEL_ID) : CHANNEL ? '@' + CHANNEL : null;
+const POST_TO_CHANNEL = process.env.POST_TO_CHANNEL !== 'false';
+const APP_SHORT_NAME = (process.env.APP_SHORT_NAME || '').trim(); // короткое имя Mini App из BotFather (необязательно)
 const DEV_USER_ID = process.env.DEV_USER_ID ? Number(process.env.DEV_USER_ID) : null;
 const PORT = process.env.PORT || 3000;
 const WEBAPP_URL = process.env.WEBAPP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '');
+const TZ = process.env.TZ_NAME || 'Europe/Minsk';
 
-const LISTING_STARS = Number(process.env.LISTING_STARS) || 50; // размещение лота, звёзды
-const BUMP_STARS = Number(process.env.BUMP_STARS) || 25; // поднятие лота, звёзды
-const LISTING_BYN = Number(process.env.LISTING_BYN) || 3; // размещение лота, BYN (ручное подтверждение)
-const MAX_STEP = Number(process.env.MAX_STEP) || 10; // максимальный шаг ставки, BYN
-const AUCTION_HOURS = Math.max(1, Math.round(Number(process.env.AUCTION_HOURS))) || 24;
-const FREE_LISTING = process.env.FREE_LISTING !== 'false'; // размещение бесплатно (на время открытия)
-const PAY_BYN_INFO = process.env.PAY_BYN_INFO || 'Реквизиты не заданы (переменная PAY_BYN_INFO)';
+// сроки торгов и их стоимость в звёздах (24 ч — бесплатно)
+const DURATIONS = [
+  { hours: 24, stars: numOr(process.env.PRICE_24H, 0) },
+  { hours: 48, stars: numOr(process.env.PRICE_48H, 10) },
+  { hours: 72, stars: numOr(process.env.PRICE_72H, 15) },
+];
+const BUMP_STARS = numOr(process.env.BUMP_STARS, 25); // поднятие лота
+const MAX_STEP = numOr(process.env.MAX_STEP, 10); // максимальный шаг ставки, BYN
+const ANTI_SNIPE_MIN = numOr(process.env.ANTI_SNIPE_MIN, 5); // ставка в последние N минут продлевает торги (0 — выключено)
+const ANTI_SNIPE_MAX_EXT = 12;
+const DIGEST_HOUR = numOr(process.env.DIGEST_HOUR, 18); // час ежедневного дайджеста (по времени TZ_NAME)
 
 if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set'); process.exit(1); }
 if (!BOT_TOKEN && !DEV_USER_ID) { console.error('BOT_TOKEN is not set'); process.exit(1); }
@@ -36,6 +47,8 @@ const pool = new pg.Pool({
 });
 const q = (text, params) => pool.query(text, params);
 
+// Миграции только добавляют: CREATE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS.
+// Данные (лоты, ставки, фото) никогда не удаляются при обновлении кода.
 async function initDb() {
   await q(`
     CREATE TABLE IF NOT EXISTS images ( id SERIAL PRIMARY KEY, mime TEXT NOT NULL, data BYTEA NOT NULL );
@@ -59,7 +72,7 @@ async function initDb() {
       bids_count INTEGER NOT NULL DEFAULT 0,
       leader_id BIGINT,
       leader_name TEXT,
-      status TEXT NOT NULL DEFAULT 'draft', -- draft | pending_review | active | ended | cancelled
+      status TEXT NOT NULL DEFAULT 'draft', -- draft | active | ended | cancelled
       pay_method TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       started_at TIMESTAMPTZ,
@@ -67,6 +80,12 @@ async function initDb() {
       bumped_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS auctions_status_idx ON auctions(status, ends_at);
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS duration_hours INTEGER NOT NULL DEFAULT 24;
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS extensions INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS notified_1h BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS notified_15m BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS channel_chat TEXT;
+    ALTER TABLE auctions ADD COLUMN IF NOT EXISTS channel_msg_id BIGINT;
 
     CREATE TABLE IF NOT EXISTS bids (
       id SERIAL PRIMARY KEY,
@@ -90,11 +109,26 @@ async function initDb() {
       user_id BIGINT NOT NULL,
       kind TEXT NOT NULL,           -- list | bump
       auction_id INTEGER,
-      method TEXT NOT NULL,         -- stars | byn | admin
+      method TEXT NOT NULL,         -- stars | admin | free
       amount NUMERIC(10,2) NOT NULL DEFAULT 0,
       charge_id TEXT UNIQUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      user_id BIGINT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      username TEXT,
+      notify BOOLEAN NOT NULL DEFAULT true,
+      blocked BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now() );
+
+    -- старые лоты «на проверке» (ручная оплата BYN убрана) возвращаем в черновики
+    UPDATE auctions SET status='draft' WHERE status='pending_review';
   `);
 }
 
@@ -106,6 +140,16 @@ const num = (v) => money(String(v ?? '').replace(',', '.'));
 const fmt = (v) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(v);
 const h = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const userLink = (id, name) => `<a href="tg://user?id=${id}">${h(name || 'пользователь')}</a>`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const fmtDate = (d) => new Date(d).toLocaleString('ru-RU', { timeZone: TZ, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+function leftHuman(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  const d = Math.floor(m / 1440), hh = Math.floor((m % 1440) / 60), mm = m % 60;
+  if (d > 0) return `${d} д ${hh} ч`;
+  if (hh > 0) return `${hh} ч ${mm} мин`;
+  return `${mm} мин`;
+}
+const priceOf = (hours) => (DURATIONS.find((d) => d.hours === Number(hours)) || DURATIONS[0]).stars;
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -134,13 +178,35 @@ function validateInitData(initData) {
   try { return JSON.parse(params.get('user')); } catch { return null; }
 }
 
-function auth(req, res, next) {
+// ---------- обязательная подписка на канал ----------
+const REQUIRE_SUB = process.env.REQUIRE_SUBSCRIPTION !== 'false';
+const subCache = new Map(); // userId -> { ok, at }
+async function isSubscribed(userId) {
+  if (!REQUIRE_SUB || !CHANNEL_CHAT || !bot) return true;
+  if (ADMIN_IDS.includes(Number(userId))) return true;
+  const c = subCache.get(userId);
+  if (c && Date.now() - c.at < (c.ok ? 5 * 60 * 1000 : 3 * 1000)) return c.ok;
+  try {
+    const m = await bot.api.getChatMember(CHANNEL_CHAT, userId);
+    const ok = ['creator', 'administrator', 'member'].includes(m.status) || (m.status === 'restricted' && m.is_member);
+    subCache.set(userId, { ok, at: Date.now() });
+    return ok;
+  } catch (e) {
+    console.error('getChatMember', e.message); // бот не админ канала и т.п. — не блокируем всех
+    return true;
+  }
+}
+
+async function auth(req, res, next) {
   let user = validateInitData(req.get('X-Init-Data'));
   if (!user && DEV_USER_ID) user = { id: DEV_USER_ID, first_name: 'Dev', username: 'dev' };
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   req.user = user;
   req.isAdmin = ADMIN_IDS.includes(Number(user.id));
   req.displayName = clean(user.first_name || user.username || 'Участник', 40);
+  if (!req.originalUrl.startsWith('/api/me') && !(await isSubscribed(user.id))) {
+    return res.status(403).json({ error: 'not_subscribed' });
+  }
   next();
 }
 function adminOnly(req, res, next) {
@@ -148,34 +214,109 @@ function adminOnly(req, res, next) {
   next();
 }
 
-// ---------- bot ----------
+async function touchUser(u, unblock = false) {
+  if (!u?.id) return;
+  const name = clean([u.first_name, u.last_name].filter(Boolean).join(' ') || u.username || '', 80);
+  await q(
+    `INSERT INTO users(user_id, name, username) VALUES ($1,$2,$3)
+     ON CONFLICT (user_id) DO UPDATE SET name=EXCLUDED.name, username=EXCLUDED.username, last_seen=now(),
+       blocked = CASE WHEN $4 THEN false ELSE users.blocked END`,
+    [u.id, name, u.username || null, unblock]
+  );
+}
+
+// ---------- bot helpers ----------
 let bot = null;
+let botUsername = null;
+
+const lotLink = (id) => {
+  if (!botUsername) return null;
+  return APP_SHORT_NAME
+    ? `https://t.me/${botUsername}/${APP_SHORT_NAME}?startapp=lot_${id}`
+    : `https://t.me/${botUsername}?start=lot_${id}`;
+};
+const botLink = () => (botUsername ? `https://t.me/${botUsername}` : null);
+const lotKb = (id, text = '🔨 Открыть лот') => (WEBAPP_URL ? { reply_markup: new InlineKeyboard().webApp(text, `${WEBAPP_URL}?lot=${id}`) } : {});
+const openAppKb = () => (WEBAPP_URL ? { reply_markup: new InlineKeyboard().webApp('Открыть аукцион', WEBAPP_URL) } : {});
 
 async function notify(userId, html, extra = {}) {
-  if (!bot || !userId) return;
+  if (!bot || !userId) return false;
   try {
     await bot.api.sendMessage(userId, html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra });
+    return true;
   } catch (e) {
-    console.error('notify failed', userId, e.message);
+    if (e.error_code === 403) await q('UPDATE users SET blocked=true WHERE user_id=$1', [userId]).catch(() => {});
+    else console.error('notify failed', userId, e.message);
+    return false;
   }
 }
 const notifyAdmins = (html) => Promise.allSettled(ADMIN_IDS.map((id) => notify(id, html)));
 
-const openAppKb = () => (WEBAPP_URL ? { reply_markup: new InlineKeyboard().webApp('Открыть аукцион', WEBAPP_URL) } : {});
+async function lotPhoto(a) {
+  if (!a.image_ids?.length) return null;
+  const { rows } = await q('SELECT data FROM images WHERE id=$1', [a.image_ids[0]]);
+  return rows[0] ? new InputFile(rows[0].data, 'lot.jpg') : null;
+}
 
-// ---------- lifecycle ----------
+function lotCaption(a, extra = '') {
+  let t = `🔨 <b>${h(a.title)}</b>\n\n`;
+  t += `📏 Размер: ${h(a.size)}\n📍 Встреча: ${h(a.city)}\n`;
+  t += `💰 Старт: ${fmt(a.start_price)} BYN · шаг ${fmt(a.min_step)}–${fmt(a.max_step)} BYN\n`;
+  t += `⏱ Торги до ${fmtDate(a.ends_at)} (${TZ.split('/').pop()})\n`;
+  if (a.description) t += `\n${h(a.description.slice(0, 250))}${a.description.length > 250 ? '…' : ''}\n`;
+  if (extra) t += `\n${extra}`;
+  return t;
+}
+
+// ---------- канал ----------
+async function postLotToChannel(a) {
+  if (!bot || !CHANNEL_CHAT || !POST_TO_CHANNEL) return;
+  try {
+    const link = lotLink(a.id);
+    const kb = new InlineKeyboard();
+    if (link) kb.url('🔨 Сделать ставку', link);
+    const caption = lotCaption(a, link ? `👉 <a href="${link}">Открыть лот и сделать ставку</a>` : '');
+    const photo = await lotPhoto(a);
+    const opts = { caption, parse_mode: 'HTML', ...(link ? { reply_markup: kb } : {}) };
+    const msg = photo
+      ? await bot.api.sendPhoto(CHANNEL_CHAT, photo, opts)
+      : await bot.api.sendMessage(CHANNEL_CHAT, caption, { parse_mode: 'HTML', ...(link ? { reply_markup: kb } : {}) });
+    await q('UPDATE auctions SET channel_chat=$2, channel_msg_id=$3 WHERE id=$1', [a.id, String(CHANNEL_CHAT), msg.message_id]);
+  } catch (e) {
+    console.error('channel post failed', a.id, e.message);
+    notifyAdmins(`⚠️ Не удалось опубликовать лот №${a.id} в канале: ${h(e.message)}\nПроверьте, что бот добавлен в канал как администратор с правом публикации. Повторить: /post ${a.id}`);
+  }
+}
+
+// обновляем пост в канале, когда лот закончился или снят
+async function updateChannelPost(a, statusLine) {
+  if (!bot || !a.channel_msg_id || !a.channel_chat) return;
+  const chat = /^-?\d+$/.test(a.channel_chat) ? Number(a.channel_chat) : a.channel_chat;
+  try {
+    const kb = new InlineKeyboard();
+    if (botLink()) kb.url('Смотреть другие лоты', botLink());
+    const caption = `🔨 <b>${h(a.title)}</b>\n\n📏 Размер: ${h(a.size)}\n📍 Встреча: ${h(a.city)}\n\n${statusLine}`;
+    await bot.api.editMessageCaption(chat, a.channel_msg_id, { caption, parse_mode: 'HTML', ...(botLink() ? { reply_markup: kb } : {}) });
+  } catch (e) {
+    console.error('channel edit failed', a.id, e.message);
+  }
+}
+
+// ---------- жизненный цикл лота ----------
 async function activate(id, method) {
   const { rows } = await q(
     `UPDATE auctions
        SET status='active', pay_method=$2, started_at=now(), bumped_at=now(),
-           ends_at = now() + make_interval(hours => $3)
-     WHERE id=$1 AND status IN ('draft','pending_review')
+           ends_at = now() + make_interval(hours => duration_hours)
+     WHERE id=$1 AND status='draft'
      RETURNING *`,
-    [id, method, AUCTION_HOURS]
+    [id, method]
   );
   const a = rows[0];
   if (a) {
-    notify(a.seller_id, `✅ Лот №${a.id} «${h(a.title)}» опубликован.\nТорги идут ${AUCTION_HOURS} ч.`, openAppKb());
+    const link = lotLink(a.id);
+    notify(a.seller_id, `✅ Лот №${a.id} «${h(a.title)}» опубликован.\nТорги идут до ${fmtDate(a.ends_at)}.${CHANNEL_CHAT && POST_TO_CHANNEL ? '\nПост с лотом отправлен в канал.' : ''}${link ? `\n\nСсылка на лот: ${link}` : ''}`, lotKb(a.id));
+    postLotToChannel(a);
   }
   return a;
 }
@@ -192,10 +333,76 @@ async function finishAuctions() {
         a.leader_id,
         `🏆 Вы выиграли лот №${a.id} «${h(a.title)}» за ${fmt(a.current_price)} BYN!\nЛичная встреча: ${h(a.city)}\nКонтакт владельца: ${h(a.contact)}`
       );
+      await updateChannelPost(a, `🏁 <b>Торги завершены</b>\nИтоговая цена: ${fmt(a.current_price)} BYN · ставок: ${a.bids_count}`);
     } else {
-      await notify(a.seller_id, `Лот №${a.id} «${h(a.title)}» завершён без ставок.`);
+      await notify(a.seller_id, `Лот №${a.id} «${h(a.title)}» завершён без ставок. Можно выставить его снова с меньшей ценой.`);
+      await updateChannelPost(a, '🏁 <b>Торги завершены</b>\nСтавок не было');
     }
   }
+}
+
+// напоминания участникам: за час и за 15 минут до конца
+async function remindEnding() {
+  if (!bot) return;
+  for (const [col, interval, label] of [['notified_1h', '1 hour', 'час'], ['notified_15m', '15 minutes', '15 минут']]) {
+    const { rows } = await q(
+      `UPDATE auctions SET ${col}=true
+       WHERE status='active' AND NOT ${col} AND ends_at > now() AND ends_at <= now() + interval '${interval}'
+       RETURNING *`
+    );
+    for (const a of rows) {
+      const { rows: people } = await q(
+        `SELECT p.user_id, p.is_bidder FROM (
+           SELECT user_id, true AS is_bidder FROM bids WHERE auction_id=$1
+           UNION
+           SELECT user_id, false FROM auction_favorites WHERE auction_id=$1
+         ) p LEFT JOIN users u ON u.user_id = p.user_id
+         WHERE COALESCE(u.notify, true) AND NOT COALESCE(u.blocked, false) AND p.user_id <> $2`,
+        [a.id, a.seller_id]
+      );
+      const bidders = new Set(people.filter((p) => p.is_bidder).map((p) => Number(p.user_id)));
+      const ids = [...new Set(people.map((p) => Number(p.user_id)))];
+      for (const uid of ids) {
+        let tail = '';
+        if (Number(a.leader_id) === uid) tail = '\nСейчас вы лидируете 🎉 Но вас могут перебить.';
+        else if (bidders.has(uid)) tail = '\nВас перебили — успейте ответить!';
+        await notify(uid, `⏰ Через ${label} закончится аукцион «${h(a.title)}»\nСейчас: ${fmt(a.current_price)} BYN${a.bids_count ? ` · ставок: ${a.bids_count}` : ''}${tail}`, lotKb(a.id, '🔨 К лоту'));
+        await sleep(50);
+      }
+      if (col === 'notified_1h') {
+        await notify(a.seller_id, `⏰ Ваш лот «${h(a.title)}» закончится через час. Сейчас ${fmt(a.current_price)} BYN, ставок: ${a.bids_count}.`, lotKb(a.id));
+      }
+    }
+  }
+}
+
+// ежедневный дайджест «скоро закончатся»
+async function maybeSendDigest() {
+  if (!bot) return;
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit' })
+      .formatToParts(new Date()).map((p) => [p.type, p.value])
+  );
+  if (Number(parts.hour) !== DIGEST_HOUR) return;
+  const ins = await q(`INSERT INTO meta(key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key`, [`digest:${parts.year}-${parts.month}-${parts.day}`]);
+  if (!ins.rowCount) return; // сегодня уже отправляли
+  const { rows } = await q(
+    `SELECT * FROM auctions WHERE status='active' AND ends_at > now() AND ends_at <= now() + interval '24 hours' ORDER BY ends_at LIMIT 6`
+  );
+  if (!rows.length) return;
+  const lines = rows.map((a, i) => {
+    const link = lotLink(a.id);
+    const title = link ? `<a href="${link}">${h(a.title)}</a>` : h(a.title);
+    return `${i + 1}. ${title} — ${fmt(a.current_price)} BYN · через ${leftHuman(new Date(a.ends_at) - Date.now())}`;
+  });
+  const text = `🔥 <b>Скоро закончатся торги</b>\n\n${lines.join('\n')}\n\nУспейте сделать ставку 👇`;
+  const { rows: subs } = await q('SELECT user_id FROM users WHERE notify AND NOT blocked');
+  let sent = 0;
+  for (const s of subs) {
+    if (await notify(s.user_id, text, openAppKb())) sent++;
+    await sleep(50);
+  }
+  console.log(`digest sent to ${sent}/${subs.length}`);
 }
 
 // ---------- app ----------
@@ -256,19 +463,23 @@ app.use('/api', express.json({ limit: '1mb' }));
 
 app.get('/api/config', (_req, res) => res.json({
   shopName: SHOP_NAME,
+  channel: CHANNEL || null,
   avatar: process.env.AVATAR_FROM_CHANNEL === 'true' && !!CHANNEL, // по умолчанию в шапке логотип LOT24
-  hours: AUCTION_HOURS,
   maxStep: MAX_STEP,
-  freeListing: FREE_LISTING,
-  fees: { listingStars: LISTING_STARS, listingByn: LISTING_BYN, bumpStars: BUMP_STARS },
+  durations: DURATIONS,
+  bumpStars: BUMP_STARS,
+  antiSnipeMin: ANTI_SNIPE_MIN,
 }));
 
-app.get('/api/me', auth, (req, res) => res.json({
-  id: req.user.id,
-  name: [req.user.first_name, req.user.last_name].filter(Boolean).join(' '),
-  username: req.user.username || null,
-  isAdmin: req.isAdmin,
-  payInfo: PAY_BYN_INFO,
+app.get('/api/me', auth, wrap(async (req, res) => {
+  touchUser(req.user).catch((e) => console.error('touchUser', e.message));
+  res.json({
+    id: req.user.id,
+    name: [req.user.first_name, req.user.last_name].filter(Boolean).join(' '),
+    username: req.user.username || null,
+    isAdmin: req.isAdmin,
+    subscribed: await isSubscribed(req.user.id),
+  });
 }));
 
 // ---------- auctions: read ----------
@@ -288,9 +499,11 @@ const mapAuction = (a, userId) => ({
   bids_count: a.bids_count,
   leader_name: a.leader_name,
   status: a.status,
-  pay_method: a.pay_method,
+  duration_hours: a.duration_hours,
+  stars: priceOf(a.duration_hours),
   ends_at: a.ends_at,
   created_at: a.created_at,
+  link: lotLink(a.id),
   mine: Number(a.seller_id) === Number(userId),
   leading: a.leader_id != null && Number(a.leader_id) === Number(userId),
   fav: !!a.fav,
@@ -361,6 +574,7 @@ app.post('/api/auctions', auth, wrap(async (req, res) => {
   const description = clean(b.description, 3000);
   const startPrice = num(b.start_price);
   const minStep = num(b.min_step);
+  const duration = DURATIONS.find((d) => d.hours === Number(b.duration_hours)) || DURATIONS[0];
 
   if (!title) throw new HttpError(400, 'Укажите название');
   if (!size) throw new HttpError(400, 'Укажите размер');
@@ -376,21 +590,21 @@ app.post('/api/auctions', auth, wrap(async (req, res) => {
   const image_ids = wanted.filter((i) => owned.has(i));
   if (!image_ids.length) throw new HttpError(400, 'Добавьте хотя бы одно фото');
 
-  const { rows: cnt } = await q(`SELECT count(*)::int AS n FROM auctions WHERE seller_id=$1 AND status IN ('draft','pending_review')`, [req.user.id]);
+  const { rows: cnt } = await q(`SELECT count(*)::int AS n FROM auctions WHERE seller_id=$1 AND status='draft'`, [req.user.id]);
   if (cnt[0].n >= 10) throw new HttpError(400, 'Слишком много неоплаченных лотов. Оплатите или удалите старые.');
 
   const { rows } = await q(
-    `INSERT INTO auctions(seller_id, seller_name, title, description, size, city, contact, image_ids, start_price, min_step, max_step, current_price)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$9) RETURNING id`,
-    [req.user.id, req.displayName, title, description, size, city, contact, image_ids, startPrice, minStep, MAX_STEP]
+    `INSERT INTO auctions(seller_id, seller_name, title, description, size, city, contact, image_ids, start_price, min_step, max_step, current_price, duration_hours)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$9,$12) RETURNING id`,
+    [req.user.id, req.displayName, title, description, size, city, contact, image_ids, startPrice, minStep, MAX_STEP, duration.hours]
   );
   const id = rows[0].id;
-  if (FREE_LISTING) {
+  if (duration.stars === 0) {
     await activate(id, 'free');
     await q(`INSERT INTO payments(user_id, kind, auction_id, method, amount) VALUES ($1,'list',$2,'free',0)`, [req.user.id, id]);
     return res.json({ id, published: true });
   }
-  res.json({ id });
+  res.json({ id, published: false, stars: duration.stars, hours: duration.hours });
 }));
 
 async function getOwnLot(req, statuses) {
@@ -407,22 +621,18 @@ async function makeInvoice(title, description, payload, label, amount) {
 }
 
 app.post('/api/auctions/:id/pay/stars', auth, wrap(async (req, res) => {
-  const a = await getOwnLot(req, ['draft', 'pending_review']);
-  const link = await makeInvoice(`Размещение лота №${a.id}`, `Аукцион на ${AUCTION_HOURS} ч: ${a.title}`, `list:${a.id}:${req.user.id}`, 'Размещение лота', LISTING_STARS);
+  const a = await getOwnLot(req, ['draft']);
+  const stars = priceOf(a.duration_hours);
+  if (stars <= 0) {
+    await activate(a.id, 'free');
+    return res.json({ published: true });
+  }
+  const link = await makeInvoice(`Размещение лота №${a.id}`, `Аукцион на ${a.duration_hours} ч: ${a.title}`, `list:${a.id}:${req.user.id}`, `Торги ${a.duration_hours} ч`, stars);
   res.json({ link });
 }));
 
-app.post('/api/auctions/:id/pay/byn', auth, wrap(async (req, res) => {
-  const a = await getOwnLot(req, ['draft']);
-  await q(`UPDATE auctions SET status='pending_review', pay_method='byn' WHERE id=$1`, [a.id]);
-  notifyAdmins(
-    `💳 Оплата ${fmt(LISTING_BYN)} BYN на проверке\nЛот №${a.id} «${h(a.title)}»\nПродавец: ${userLink(a.seller_id, a.seller_name)}\nПодтвердите в админке мини-приложения.`
-  );
-  res.json({ ok: true });
-}));
-
 app.post('/api/auctions/:id/publish-free', auth, adminOnly, wrap(async (req, res) => {
-  const a = await getOwnLot(req, ['draft', 'pending_review']);
+  const a = await getOwnLot(req, ['draft']);
   await activate(a.id, 'admin');
   await q(`INSERT INTO payments(user_id, kind, auction_id, method, amount) VALUES ($1,'list',$2,'admin',0)`, [req.user.id, a.id]);
   res.json({ ok: true });
@@ -442,10 +652,11 @@ app.delete('/api/auctions/:id', auth, wrap(async (req, res) => {
   const mine = Number(a.seller_id) === Number(req.user.id);
   if (!mine && !req.isAdmin) throw new HttpError(403, 'Нет доступа');
   if (!req.isAdmin) {
-    const canCancel = ['draft', 'pending_review'].includes(a.status) || (a.status === 'active' && a.bids_count === 0);
+    const canCancel = a.status === 'draft' || (a.status === 'active' && a.bids_count === 0);
     if (!canCancel) throw new HttpError(400, 'Лот со ставками отменить нельзя');
   }
   await q(`UPDATE auctions SET status='cancelled' WHERE id=$1`, [a.id]);
+  await updateChannelPost(a, '🚫 <b>Лот снят с торгов</b>');
   if (!mine) notify(a.seller_id, `Лот №${a.id} «${h(a.title)}» снят администратором.`);
   res.json({ ok: true });
 }));
@@ -459,6 +670,7 @@ app.post('/api/auctions/:id/bid', auth, wrap(async (req, res) => {
   const client = await pool.connect();
   let a;
   let prevLeader = null;
+  let extendedTo = null;
   try {
     await client.query('BEGIN');
     const { rows } = await client.query('SELECT *, (ends_at > now()) AS live FROM auctions WHERE id=$1 FOR UPDATE', [id]);
@@ -482,6 +694,15 @@ app.post('/api/auctions/:id/bid', auth, wrap(async (req, res) => {
       'UPDATE auctions SET current_price=$2, bids_count=bids_count+1, leader_id=$3, leader_name=$4 WHERE id=$1',
       [id, amount, req.user.id, req.displayName]
     );
+    // антиснайпер: ставка в последние минуты продлевает торги
+    if (ANTI_SNIPE_MIN > 0 && a.extensions < ANTI_SNIPE_MAX_EXT) {
+      const r = await client.query(
+        `UPDATE auctions SET ends_at = now() + make_interval(mins => $2), extensions = extensions + 1
+         WHERE id=$1 AND ends_at < now() + make_interval(mins => $2) RETURNING ends_at`,
+        [id, ANTI_SNIPE_MIN]
+      );
+      if (r.rowCount) extendedTo = r.rows[0].ends_at;
+    }
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -489,9 +710,10 @@ app.post('/api/auctions/:id/bid', auth, wrap(async (req, res) => {
   } finally {
     client.release();
   }
-  if (prevLeader) notify(prevLeader, `⚡ Вашу ставку перебили на лоте «${h(a.title)}». Сейчас ${fmt(amount)} BYN.`, openAppKb());
-  notify(a.seller_id, `💰 Новая ставка на лот «${h(a.title)}»: ${fmt(amount)} BYN (${h(req.displayName)})`);
-  res.json({ ok: true, current_price: amount });
+  const ext = extendedTo ? `\nТорги продлены до ${fmtDate(extendedTo)}.` : '';
+  if (prevLeader) notify(prevLeader, `⚡ Вашу ставку перебили на лоте «${h(a.title)}». Сейчас ${fmt(amount)} BYN.${ext}`, lotKb(id, '🔨 Ответить ставкой'));
+  notify(a.seller_id, `💰 Новая ставка на лот «${h(a.title)}»: ${fmt(amount)} BYN (${h(req.displayName)})${ext}`);
+  res.json({ ok: true, current_price: amount, extended: !!extendedTo });
 }));
 
 // ---------- admin ----------
@@ -504,41 +726,32 @@ app.get('/api/admin/auctions', auth, adminOnly, wrap(async (req, res) => {
   res.json({ now: new Date().toISOString(), items: rows.map((a) => ({ ...mapAuction(a, req.user.id), seller_id: a.seller_id, seller_name: a.seller_name })) });
 }));
 
-app.post('/api/admin/auctions/:id/approve', auth, adminOnly, wrap(async (req, res) => {
-  const id = Number(req.params.id);
-  const a = await activate(id, 'byn');
-  if (!a) throw new HttpError(400, 'Лот уже обработан');
-  await q(`INSERT INTO payments(user_id, kind, auction_id, method, amount) VALUES ($1,'list',$2,'byn',$3)`, [a.seller_id, a.id, LISTING_BYN]);
-  res.json({ ok: true });
-}));
-
-app.post('/api/admin/auctions/:id/reject', auth, adminOnly, wrap(async (req, res) => {
-  const { rows } = await q(`UPDATE auctions SET status='draft', pay_method=NULL WHERE id=$1 AND status='pending_review' RETURNING *`, [Number(req.params.id)]);
-  const a = rows[0];
-  if (!a) throw new HttpError(400, 'Лот уже обработан');
-  notify(a.seller_id, `Оплата лота №${a.id} «${h(a.title)}» не найдена. Оплатите ещё раз (звёздами или переводом) и отправьте на проверку.`, openAppKb());
-  res.json({ ok: true });
-}));
-
 // ---------- bot setup ----------
 async function startBot() {
   if (!BOT_TOKEN) { console.warn('BOT_TOKEN not set, bot disabled (DEV mode)'); return; }
   bot = new Bot(BOT_TOKEN);
+  await bot.init();
+  botUsername = bot.botInfo.username;
+  console.log(`Bot @${botUsername} ready`);
+
+  const durationsText = () => DURATIONS.map((d) => `${d.hours === 24 ? '24 часа' : d.hours / 24 + ' дня'} — ${d.stars ? d.stars + ' ⭐' : 'бесплатно'}`).join(' · ');
 
   const welcomeText = () =>
     `<b>Добро пожаловать в ${h(SHOP_NAME)}!</b> 👋\n\n` +
     `Аукцион вещей прямо в Telegram.\n\n` +
-    `🔨 Выставляйте свои вещи${FREE_LISTING ? ' — размещение <b>бесплатно</b> (акция к открытию)' : ''}\n` +
-    `⏱ Торги длятся <b>${AUCTION_HOURS} часа</b>\n` +
+    `🔨 Выставляйте свои вещи на торги\n` +
+    `⏱ Срок: ${durationsText()}\n` +
     `💸 Делайте ставки и выигрывайте лоты\n` +
+    `🔔 Бот напомнит, когда торги закончатся\n` +
     `🤝 Победитель и продавец договариваются о личной встрече\n\n` +
     `Нажмите кнопку ниже, чтобы открыть аукцион 👇`;
 
   const helpText = () =>
     `<b>Как это работает</b>\n\n` +
-    `<b>Выставить лот</b>\nВкладка «Выставить»: фото, название, размер, стартовая цена, шаг ставки, город для встречи и ваш контакт.${FREE_LISTING ? ' Размещение бесплатно.' : ` Размещение — ${LISTING_STARS} ⭐ или ${fmt(LISTING_BYN)} BYN.`}\n\n` +
-    `<b>Сделать ставку</b>\nОткройте лот и выберите сумму. Шаг ставки — от минимального шага лота до ${fmt(MAX_STEP)} BYN. Если вас перебьют, бот пришлёт уведомление.\n\n` +
-    `<b>Итоги</b>\nЧерез ${AUCTION_HOURS} ч торги закрываются. Победитель получит контакт владельца и город, продавец — профиль победителя.\n\n` +
+    `<b>Выставить лот</b>\nВкладка «Выставить»: фото, название, размер, стартовая цена, шаг ставки, город для встречи и ваш контакт.\nСрок торгов: ${durationsText()}.\nНовый лот автоматически появляется в нашем канале со ссылкой.\n\n` +
+    `<b>Сделать ставку</b>\nОткройте лот и выберите сумму. Шаг ставки — от минимального шага лота до ${fmt(MAX_STEP)} BYN.${ANTI_SNIPE_MIN ? ` Если ставку сделали в последние ${ANTI_SNIPE_MIN} мин, торги продлеваются.` : ''}\n\n` +
+    `<b>Уведомления</b>\nБот пишет, если вашу ставку перебили, за час и за 15 минут до конца лотов из «Избранного» и ваших ставок, а также присылает ежедневный дайджест «Скоро закончатся».\n/mute — отключить напоминания и дайджест, /unmute — включить.\n\n` +
+    `<b>Итоги</b>\nПобедитель получит контакт владельца и город, продавец — профиль победителя.\n\n` +
     `<b>Поднять лот</b>\nЗа ${BUMP_STARS} ⭐ лот окажется в начале списка.\n\n` +
     `<b>Безопасность</b>\nВстречайтесь в людных местах, осматривайте вещь перед оплатой и не переводите предоплату незнакомым людям.`;
 
@@ -550,8 +763,28 @@ async function startBot() {
     return kb;
   };
 
+  async function sendLotCard(ctx, id) {
+    const { rows } = await q('SELECT * FROM auctions WHERE id=$1', [id]);
+    const a = rows[0];
+    if (!a || !['active', 'ended'].includes(a.status)) return ctx.reply('Лот не найден или снят с торгов.', openAppKb());
+    const live = a.status === 'active' && new Date(a.ends_at) > new Date();
+    const extra = live
+      ? `💵 Сейчас: <b>${fmt(a.current_price)} BYN</b> · ставок: ${a.bids_count}\n⏳ Осталось: ${leftHuman(new Date(a.ends_at) - Date.now())}`
+      : `🏁 Торги завершены. Итог: ${fmt(a.current_price)} BYN`;
+    const caption = lotCaption(a, extra);
+    const opts = { caption, parse_mode: 'HTML', ...lotKb(a.id, live ? '🔨 Сделать ставку' : 'Открыть лот') };
+    const photo = await lotPhoto(a);
+    if (photo) return ctx.replyWithPhoto(photo, opts);
+    return ctx.reply(caption, { parse_mode: 'HTML', ...lotKb(a.id, live ? '🔨 Сделать ставку' : 'Открыть лот') });
+  }
+
   let welcomePhotoId = null; // кэшируем file_id, чтобы не загружать картинку каждый раз
   bot.command('start', async (ctx) => {
+    touchUser(ctx.from, true).catch(() => {});
+    const m = /^lot_(\d+)$/.exec(String(ctx.match || '').trim());
+    if (m) {
+      try { return await sendLotCard(ctx, Number(m[1])); } catch (e) { console.error('lot card', e.message); }
+    }
     const opts = { caption: welcomeText(), parse_mode: 'HTML', reply_markup: startKb() };
     try {
       if (welcomePhotoId) return await ctx.replyWithPhoto(welcomePhotoId, opts);
@@ -569,13 +802,94 @@ async function startBot() {
     await ctx.reply(helpText(), { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   });
 
+  bot.command('mute', async (ctx) => {
+    await touchUser(ctx.from, true);
+    await q('UPDATE users SET notify=false WHERE user_id=$1', [ctx.from.id]);
+    await ctx.reply('🔕 Напоминания и дайджест отключены. Уведомления о перебитых ставках и итогах торгов продолжат приходить. Включить обратно: /unmute');
+  });
+  bot.command('unmute', async (ctx) => {
+    await touchUser(ctx.from, true);
+    await q('UPDATE users SET notify=true WHERE user_id=$1', [ctx.from.id]);
+    await ctx.reply('🔔 Напоминания и дайджест включены.');
+  });
+
+  // ----- команды администратора -----
+  const adminOnlyCmd = (fn) => async (ctx) => {
+    if (!ADMIN_IDS.includes(ctx.from?.id)) return;
+    try { await fn(ctx); } catch (e) { console.error('admin cmd', e.message); await ctx.reply('Ошибка: ' + e.message); }
+  };
+
+  bot.command('stats', adminOnlyCmd(async (ctx) => {
+    const { rows } = await q(`SELECT
+      (SELECT count(*) FROM users) AS users,
+      (SELECT count(*) FROM users WHERE blocked) AS blocked,
+      (SELECT count(*) FROM auctions WHERE status='active' AND ends_at > now()) AS active,
+      (SELECT count(*) FROM auctions WHERE status='ended') AS ended,
+      (SELECT count(*) FROM auctions WHERE status='draft') AS drafts,
+      (SELECT count(*) FROM bids) AS bids,
+      (SELECT coalesce(sum(amount),0) FROM payments WHERE method='stars') AS stars`);
+    const s = rows[0];
+    await ctx.reply(
+      `📊 <b>Статистика</b>\nПользователей: ${s.users} (заблокировали бота: ${s.blocked})\nАктивных лотов: ${s.active}\nЗавершённых: ${s.ended}\nНеоплаченных черновиков: ${s.drafts}\nВсего ставок: ${s.bids}\nПолучено звёзд: ${fmt(s.stars)} ⭐`,
+      { parse_mode: 'HTML' }
+    );
+  }));
+
+  bot.command('backup', adminOnlyCmd(async (ctx) => {
+    const [auctions, bids, users, payments] = await Promise.all([
+      q('SELECT * FROM auctions ORDER BY id'), q('SELECT * FROM bids ORDER BY id'),
+      q('SELECT * FROM users ORDER BY user_id'), q('SELECT * FROM payments ORDER BY id'),
+    ]);
+    const json = JSON.stringify({ exported_at: new Date().toISOString(), auctions: auctions.rows, bids: bids.rows, users: users.rows, payments: payments.rows }, null, 1);
+    const day = new Date().toISOString().slice(0, 10);
+    await ctx.replyWithDocument(new InputFile(Buffer.from(json, 'utf-8'), `lot24-backup-${day}.json`), {
+      caption: `Резервная копия: лотов ${auctions.rowCount}, ставок ${bids.rowCount}, пользователей ${users.rowCount}. Фото хранятся в базе данных (бэкапьте её средствами Railway).`,
+    });
+  }));
+
+  bot.command('broadcast', adminOnlyCmd(async (ctx) => {
+    const text = String(ctx.match || '').trim();
+    if (!text) return ctx.reply('Использование: /broadcast текст сообщения (HTML-теги <b>, <i>, <a> допустимы)');
+    const { rows } = await q('SELECT user_id FROM users WHERE NOT blocked');
+    await ctx.reply(`Отправляю ${rows.length} пользователям…`);
+    let ok = 0;
+    for (const r of rows) {
+      if (await notify(r.user_id, text, openAppKb())) ok++;
+      await sleep(50);
+    }
+    await ctx.reply(`Готово: доставлено ${ok} из ${rows.length}.`);
+  }));
+
+  bot.command('post', adminOnlyCmd(async (ctx) => {
+    const id = Number(String(ctx.match || '').trim());
+    if (!id) return ctx.reply('Использование: /post НОМЕР_ЛОТА — повторно отправить лот в канал');
+    const { rows } = await q(`SELECT * FROM auctions WHERE id=$1 AND status='active'`, [id]);
+    if (!rows[0]) return ctx.reply('Активный лот не найден.');
+    await postLotToChannel(rows[0]);
+    await ctx.reply('Отправлено (если не вышло — придёт предупреждение).');
+  }));
+
   // описание бота (видно до нажатия START) и меню команд
-  bot.api.setMyDescription(`${SHOP_NAME} — аукцион вещей в Telegram. Выставляйте лоты, делайте ставки, торги длятся ${AUCTION_HOURS} часа. Нажмите START!`).catch((e) => console.error('description', e.message));
-  bot.api.setMyShortDescription(`Аукцион вещей: выставляйте лоты и делайте ставки. Торги ${AUCTION_HOURS} часа 🔨`).catch((e) => console.error('short description', e.message));
+  bot.api.setMyDescription(`${SHOP_NAME} — аукцион вещей в Telegram. Выставляйте лоты, делайте ставки, бот напомнит о конце торгов. Нажмите START!`).catch((e) => console.error('description', e.message));
+  bot.api.setMyShortDescription('Аукцион вещей: выставляйте лоты и делайте ставки. Торги 24 часа и дольше 🔨').catch((e) => console.error('short description', e.message));
   bot.api.setMyCommands([
     { command: 'start', description: 'Открыть аукцион' },
     { command: 'help', description: 'Как это работает' },
+    { command: 'mute', description: 'Отключить напоминания' },
+    { command: 'unmute', description: 'Включить напоминания' },
   ]).catch((e) => console.error('commands', e.message));
+  for (const id of ADMIN_IDS) {
+    bot.api.setMyCommands([
+      { command: 'start', description: 'Открыть аукцион' },
+      { command: 'help', description: 'Как это работает' },
+      { command: 'mute', description: 'Отключить напоминания' },
+      { command: 'unmute', description: 'Включить напоминания' },
+      { command: 'stats', description: 'Статистика (админ)' },
+      { command: 'backup', description: 'Резервная копия (админ)' },
+      { command: 'broadcast', description: 'Рассылка (админ)' },
+      { command: 'post', description: 'Повторить пост в канал (админ)' },
+    ], { scope: { type: 'chat', chat_id: id } }).catch(() => {});
+  }
 
   bot.on('pre_checkout_query', async (ctx) => {
     try {
@@ -583,7 +897,7 @@ async function startBot() {
       const { rows } = await q('SELECT status, seller_id, (ends_at > now()) AS live FROM auctions WHERE id=$1', [Number(idStr)]);
       const a = rows[0];
       const okOwner = a && String(a.seller_id) === String(uid);
-      if (kind === 'list' && okOwner && ['draft', 'pending_review'].includes(a.status)) return ctx.answerPreCheckoutQuery(true);
+      if (kind === 'list' && okOwner && a.status === 'draft') return ctx.answerPreCheckoutQuery(true);
       if (kind === 'bump' && okOwner && a.status === 'active' && a.live) return ctx.answerPreCheckoutQuery(true);
       return ctx.answerPreCheckoutQuery(false, 'Лот больше недоступен для этой операции');
     } catch (e) {
@@ -632,5 +946,11 @@ async function startBot() {
 await initDb();
 app.listen(PORT, () => console.log(`Server on :${PORT}`));
 await startBot();
-setInterval(() => finishAuctions().catch((e) => console.error('finish', e.message)), 30 * 1000);
-finishAuctions().catch((e) => console.error('finish', e.message));
+
+const safe = (name, fn) => () => fn().catch((e) => console.error(name, e.message));
+setInterval(safe('finish', finishAuctions), 30 * 1000);
+setInterval(safe('remind', remindEnding), 60 * 1000);
+setInterval(safe('digest', maybeSendDigest), 5 * 60 * 1000);
+safe('finish', finishAuctions)();
+safe('remind', remindEnding)();
+safe('digest', maybeSendDigest)();
