@@ -329,6 +329,7 @@ function drawLotDyn(dyn, state, refresh) {
   } else if (S.me?.isAdmin && a.status !== 'cancelled') {
     owner = '<div class="box"><button class="btn danger" id="delBtn">Снять лот (админ)</button></div>';
   }
+  if (S.me?.isAdmin && live) owner += '<div class="box"><button class="btn sec" id="repostBtn">📣 Отправить / репост в канал</button></div>';
 
   const ended = !live && ['active', 'ended'].includes(a.status);
   const resultBox = ended
@@ -376,6 +377,12 @@ function drawLotDyn(dyn, state, refresh) {
     const url = 'https://t.me/share/url?url=' + encodeURIComponent(a.link) + '&text=' + encodeURIComponent(`🔨 ${a.title} — сейчас ${byn(a.current_price)}`);
     if (tg?.openTelegramLink) tg.openTelegramLink(url);
     else window.open(url, '_blank');
+  });
+  dyn.querySelector('#repostBtn')?.addEventListener('click', async (ev) => {
+    if (!(await confirmBox('Отправить лот в канал? Прошлый пост будет заменён.'))) return;
+    ev.target.disabled = true;
+    try { await api(`/admin/auctions/${a.id}/repost`, 'POST'); toast('Лот отправлен в канал'); } catch (err) { toast(err.message); }
+    ev.target.disabled = false;
   });
   dyn.querySelector('#payBtn')?.addEventListener('click', () => paySheet(a));
   dyn.querySelector('#bumpBtn')?.addEventListener('click', () => payStars(`/auctions/${a.id}/bump`, 'Лот поднят в начало списка'));
@@ -549,7 +556,7 @@ async function viewAdmin() {
         ? d.items.map((a) => `<div class="box" data-id="${a.id}" style="padding:12px">
             ${rowHtml(a).replace('class="item"', 'class="item" style="box-shadow:none;padding:0"')}
             <div class="muted" style="margin:8px 0">Продавец: ${esc(a.seller_name)} (id ${a.seller_id}) · ${esc(a.contact)}</div>
-            ${a.status !== 'cancelled' ? '<button class="btn sm danger" data-adm="del">Снять лот</button>' : ''}
+            <div class="row">${a.status === 'active' ? '<button class="btn sm" data-adm="repost">📣 В канал</button>' : ''}${a.status !== 'cancelled' ? '<button class="btn sm danger" data-adm="del">Снять лот</button>' : ''}</div>
           </div>`).join('')
         : `<div class="empty">Лотов нет</div>`
     }</div>`;
@@ -561,7 +568,7 @@ async function viewAdmin() {
     if (kind === 'del' && !(await confirmBox('Снять лот?'))) return;
     try {
       if (kind === 'del') await api('/auctions/' + id, 'DELETE');
-      else await api(`/admin/auctions/${id}/${kind}`, 'POST');
+      else { await api(`/admin/auctions/${id}/${kind}`, 'POST'); toast('Лот отправлен в канал'); }
       viewAdmin();
     } catch (err) {
       toast(err.message);
