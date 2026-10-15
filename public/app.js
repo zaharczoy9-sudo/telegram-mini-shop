@@ -11,15 +11,17 @@ const r2 = (n) => Math.round(n * 100) / 100;
 const S = {
   tab: 'catalog',
   me: null,
-  cfg: { shopName: 'LOT24', hours: 24, maxStep: 10, fees: { listingStars: 50, listingByn: 3, bumpStars: 25 } },
+  cfg: { shopName: 'LOT24', maxStep: 10, bumpStars: 25, antiSnipeMin: 5, durations: [{ hours: 24, stars: 0 }, { hours: 48, stars: 10 }, { hours: 72, stars: 15 }] },
   q: '',
   sort: 'bump',
   off: 0, // server time offset, ms
   mineTab: 'lots',
-  adminTab: 'pending',
+  adminTab: 'all',
   poll: null,
 };
-const F = { title: '', size: '', start_price: '', min_step: '', city: '', contact: '', description: '', image_ids: [] };
+const F = { title: '', size: '', start_price: '', min_step: '', city: '', contact: '', description: '', image_ids: [], duration_hours: 24 };
+const durLabel = (h) => (h === 24 ? '24 часа' : h / 24 + ' дня');
+const durPrice = (h) => S.cfg.durations.find((d) => d.hours === h)?.stars ?? 0;
 
 const ICON = {
   search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>',
@@ -29,7 +31,6 @@ const ICON = {
 
 const STATUS = {
   draft: ['Не оплачен', 'confirmed'],
-  pending_review: ['На проверке', 'new'],
   active: ['Идёт', 'done'],
   ended: ['Завершён', 'cancelled'],
   cancelled: ['Снят', 'cancelled'],
@@ -85,6 +86,7 @@ function leftText(endsAt) {
   const hh = Math.floor(s / 3600);
   const mm = Math.floor((s % 3600) / 60);
   const ss = s % 60;
+  if (hh >= 24) return `${Math.floor(hh / 24)}д ${hh % 24}ч`;
   return hh > 0 ? `${hh}ч ${String(mm).padStart(2, '0')}м` : `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
 setInterval(() => {
@@ -166,7 +168,7 @@ async function viewCatalog() {
   $('#top').innerHTML = `
     <div class="header-row brand">
       <div class="logo"><img src="${S.cfg.avatar ? '/avatar.jpg' : '/logo.png'}" alt="" onerror="this.onerror=null;this.src='/logo.png'"></div>
-      <div><h1 class="title">${esc(S.cfg.shopName)}</h1><div class="sub">аукцион · ${S.cfg.hours} часа</div></div>
+      <div><h1 class="title">${esc(S.cfg.shopName)}</h1><div class="sub">аукцион · 24 часа и дольше</div></div>
     </div>
     <div class="row">
       <label class="search">${ICON.search}<input id="q" placeholder="Найти лот..." value="${esc(S.q)}"></label>
@@ -311,16 +313,16 @@ function drawLotDyn(dyn, state, refresh) {
 
   let owner = '';
   if (a.mine) {
-    if (a.status === 'draft' || a.status === 'pending_review') {
+    if (a.status === 'draft') {
       owner = `<div class="box">
-        <b>${a.status === 'draft' ? 'Лот не опубликован' : 'Оплата на проверке'}</b>
-        <div class="muted" style="margin:4px 0 10px">${a.status === 'draft' ? 'Оплатите размещение, чтобы запустить торги.' : 'Администратор проверит перевод. Можно оплатить звёздами и не ждать.'}</div>
+        <b>Лот не опубликован</b>
+        <div class="muted" style="margin:4px 0 10px">Оплатите размещение (${a.stars} ⭐ за ${durLabel(a.duration_hours)}), чтобы запустить торги.</div>
         <button class="btn" id="payBtn">Оплатить и опубликовать</button>
         <button class="btn danger" id="delBtn" style="margin-top:8px">Удалить лот</button>
       </div>`;
     } else if (live) {
       owner = `<div class="box">
-        <button class="btn" id="bumpBtn">🔝 Поднять за ${S.cfg.fees.bumpStars} ⭐</button>
+        <button class="btn" id="bumpBtn">🔝 Поднять за ${S.cfg.bumpStars} ⭐</button>
         ${a.bids_count === 0 ? '<button class="btn danger" id="delBtn" style="margin-top:8px">Снять с торгов</button>' : '<div class="muted" style="margin-top:8px">Лот со ставками снять нельзя.</div>'}
       </div>`;
     }
@@ -344,6 +346,8 @@ function drawLotDyn(dyn, state, refresh) {
       ${a.bids_count ? `<div class="muted" style="margin-top:6px">Лидер: ${esc(a.leader_name)} · ${a.bids_count} ${plural(a.bids_count, ['ставка', 'ставки', 'ставок'])}</div>` : ''}
     </div>
     ${resultBox}${controls}${owner}
+    ${live && a.link ? '<button class="btn sec" id="shareBtn" style="margin-bottom:10px">📤 Поделиться лотом</button>' : ''}
+    ${live && S.cfg.antiSnipeMin ? `<div class="muted" style="margin-bottom:10px">Ставка в последние ${S.cfg.antiSnipeMin} мин продлевает торги.</div>` : ''}
     ${bids.length ? `<div class="box"><h4>История ставок</h4>${bids.map((b) => `<div class="row" style="justify-content:space-between;padding:4px 0"><span>${esc(b.user_name)} <small class="muted">${ago(b.created_at)}</small></span><b>${byn(b.amount)}</b></div>`).join('')}</div>` : ''}`;
 
   const input = dyn.querySelector('#bidAmt');
@@ -367,6 +371,11 @@ function drawLotDyn(dyn, state, refresh) {
       ev.target.disabled = false;
       refresh().catch(() => {});
     }
+  });
+  dyn.querySelector('#shareBtn')?.addEventListener('click', () => {
+    const url = 'https://t.me/share/url?url=' + encodeURIComponent(a.link) + '&text=' + encodeURIComponent(`🔨 ${a.title} — сейчас ${byn(a.current_price)}`);
+    if (tg?.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, '_blank');
   });
   dyn.querySelector('#payBtn')?.addEventListener('click', () => paySheet(a));
   dyn.querySelector('#bumpBtn')?.addEventListener('click', () => payStars(`/auctions/${a.id}/bump`, 'Лот поднят в начало списка'));
@@ -400,12 +409,12 @@ function payStars(path, okText) {
 }
 
 function paySheet(a) {
-  const f = S.cfg.fees;
+  const hours = a.duration_hours || F.duration_hours;
+  const stars = a.stars ?? durPrice(hours);
   sheet(
     `<h2>Размещение лота №${a.id}</h2>
-     <p class="muted" style="margin:0 0 14px">Аукцион длится ${S.cfg.hours} ч с момента публикации.</p>
-     <button class="btn" id="pStars">Оплатить ${f.listingStars} ⭐ — сразу</button>
-     <button class="btn sec" id="pByn" style="margin-top:8px">Оплатить ${byn(f.listingByn)} переводом</button>
+     <p class="muted" style="margin:0 0 14px">Аукцион на ${durLabel(hours)} с момента публикации. После оплаты лот автоматически попадёт в наш канал.</p>
+     <button class="btn" id="pStars">Оплатить ${stars} ⭐</button>
      ${S.me?.isAdmin ? '<button class="btn sec" id="pFree" style="margin-top:8px">Опубликовать бесплатно (админ)</button>' : ''}
      <button class="btn sec" id="pLater" style="margin-top:8px">Позже</button>`,
     (el) => {
@@ -414,32 +423,6 @@ function paySheet(a) {
       el.querySelector('#pFree')?.addEventListener('click', async () => {
         try { await api(`/auctions/${a.id}/publish-free`, 'POST'); closeSheet(); toast('Опубликовано'); S.tab = 'mine'; render(); } catch (err) { toast(err.message); }
       });
-      el.querySelector('#pByn').onclick = () => {
-        sheet(
-          `<h2>Перевод ${byn(f.listingByn)}</h2>
-           <div class="box" style="white-space:pre-wrap">${esc(S.me?.payInfo || '')}</div>
-           <p class="muted">В комментарии к переводу укажите: <b>лот №${a.id}</b>.<br>После перевода нажмите кнопку ниже — администратор подтвердит оплату и лот появится в аукционе.</p>
-           <button class="btn" id="paid">Я оплатил(а)</button>
-           <button class="btn sec" id="back" style="margin-top:8px">Назад</button>`,
-          (el2) => {
-            el2.querySelector('#back').onclick = () => paySheet(a);
-            el2.querySelector('#paid').onclick = async (ev) => {
-              ev.target.disabled = true;
-              try {
-                await api(`/auctions/${a.id}/pay/byn`, 'POST');
-                closeSheet();
-                toast('Отправлено на проверку');
-                S.tab = 'mine';
-                S.mineTab = 'lots';
-                render();
-              } catch (err) {
-                toast(err.message);
-                ev.target.disabled = false;
-              }
-            };
-          }
-        );
-      };
     }
   );
 }
@@ -469,12 +452,12 @@ async function uploadImage(file) {
 function viewCreate() {
   $('#top').innerHTML = '<h1 class="title">Выставить лот</h1>';
   if (!F.contact && S.me?.username) F.contact = '@' + S.me.username;
-  const f = S.cfg.fees;
   const v = $('#view');
   v.innerHTML = `
     <div class="box info-box">
-      Аукцион длится <b>${S.cfg.hours} ч</b>. ${S.cfg.freeListing ? 'Размещение <b>бесплатно</b> (акция к открытию).' : `Размещение: <b>${f.listingStars} ⭐</b> или <b>${byn(f.listingByn)}</b>.`}
-      Поднять лот в начало списка — <b>${f.bumpStars} ⭐</b>.
+      <b>Срок торгов</b>
+      <div class="chips" style="padding-top:8px" id="durs">${S.cfg.durations.map((d) => `<button class="chip ${F.duration_hours === d.hours ? 'on' : ''}" data-h="${d.hours}">${durLabel(d.hours)} · ${d.stars ? d.stars + ' ⭐' : 'бесплатно'}</button>`).join('')}</div>
+      <div class="muted" style="margin-top:8px">Новый лот сразу публикуется в канале со ссылкой. Поднять лот в начало списка — <b>${S.cfg.bumpStars} ⭐</b>.</div>
     </div>
     <div class="box">
       <label style="margin-top:0">Фото (до 10)</label>
@@ -495,6 +478,12 @@ function viewCreate() {
     </div>
     <button class="btn" id="go">Продолжить</button>`;
 
+  v.querySelectorAll('#durs [data-h]').forEach((b) => (b.onclick = () => {
+    F.duration_hours = Number(b.dataset.h);
+    v.querySelectorAll('#durs .chip').forEach((c) => c.classList.toggle('on', c === b));
+    v.querySelector('#go').textContent = durPrice(F.duration_hours) ? 'Продолжить к оплате' : 'Опубликовать';
+  }));
+  v.querySelector('#go').textContent = durPrice(F.duration_hours) ? 'Продолжить к оплате' : 'Опубликовать';
   const bind = (id, key) => v.querySelector(id).addEventListener('input', (e) => (F[key] = e.target.value));
   bind('#ft', 'title'); bind('#fz', 'size'); bind('#fc', 'city'); bind('#fp', 'start_price');
   bind('#fs', 'min_step'); bind('#fk', 'contact'); bind('#fd', 'description');
@@ -523,9 +512,9 @@ function viewCreate() {
     if (!F.image_ids.length) return toast('Добавьте хотя бы одно фото');
     e.target.disabled = true;
     try {
-      const { id, published } = await api('/auctions', 'POST', F);
+      const { id, published, stars, hours } = await api('/auctions', 'POST', F);
       const title = F.title;
-      Object.assign(F, { title: '', size: '', start_price: '', min_step: '', city: '', description: '', image_ids: [] });
+      Object.assign(F, { title: '', size: '', start_price: '', min_step: '', city: '', description: '', image_ids: [], duration_hours: 24 });
       if (published) {
         toast('Лот опубликован!');
         tg?.HapticFeedback?.notificationOccurred?.('success');
@@ -534,7 +523,7 @@ function viewCreate() {
         render();
         return;
       }
-      paySheet({ id, title });
+      paySheet({ id, title, stars, duration_hours: hours });
       viewCreate();
     } catch (err) {
       toast(err.message);
@@ -546,14 +535,13 @@ function viewCreate() {
 // ---------- admin ----------
 async function viewAdmin() {
   $('#top').innerHTML = '<h1 class="title">Админ-панель</h1>';
-  const status = S.adminTab === 'pending' ? 'pending_review' : '';
-  const d = await api('/admin/auctions' + (status ? '?status=' + status : ''));
+  const d = await api('/admin/auctions' + (S.adminTab === 'active' ? '?status=active' : ''));
   syncTime(d.now);
   ITEMS = d.items;
   const v = $('#view');
   v.innerHTML = `
     <div class="tabs">
-      <button data-at="pending" class="${S.adminTab === 'pending' ? 'on' : ''}">Оплаты BYN</button>
+      <button data-at="active" class="${S.adminTab === 'active' ? 'on' : ''}">Активные</button>
       <button data-at="all" class="${S.adminTab === 'all' ? 'on' : ''}">Все лоты</button>
     </div>
     <div class="list">${
@@ -561,11 +549,9 @@ async function viewAdmin() {
         ? d.items.map((a) => `<div class="box" data-id="${a.id}" style="padding:12px">
             ${rowHtml(a).replace('class="item"', 'class="item" style="box-shadow:none;padding:0"')}
             <div class="muted" style="margin:8px 0">Продавец: ${esc(a.seller_name)} (id ${a.seller_id}) · ${esc(a.contact)}</div>
-            ${a.status === 'pending_review'
-              ? `<div class="row"><button class="btn sm" data-adm="approve">Подтвердить оплату</button><button class="btn sm danger" data-adm="reject">Отклонить</button></div>`
-              : a.status !== 'cancelled' ? '<button class="btn sm danger" data-adm="del">Снять лот</button>' : ''}
+            ${a.status !== 'cancelled' ? '<button class="btn sm danger" data-adm="del">Снять лот</button>' : ''}
           </div>`).join('')
-        : `<div class="empty">${S.adminTab === 'pending' ? 'Нет оплат на проверке' : 'Лотов нет'}</div>`
+        : `<div class="empty">Лотов нет</div>`
     }</div>`;
   v.querySelectorAll('[data-at]').forEach((b) => (b.onclick = () => { S.adminTab = b.dataset.at; viewAdmin(); }));
   v.querySelectorAll('[data-adm]').forEach((b) => (b.onclick = async (e) => {
@@ -595,6 +581,7 @@ async function render() {
     else if (S.tab === 'admin' && S.me?.isAdmin) await viewAdmin();
     else { S.tab = 'catalog'; await viewCatalog(); }
   } catch (err) {
+    if (err.message === 'not_subscribed') return showGate();
     $('#view').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
 }
@@ -605,15 +592,34 @@ document.querySelectorAll('#nav button').forEach((b) => (b.onclick = () => {
   render();
 }));
 
+function showGate() {
+  $('#top').innerHTML = '';
+  document.querySelector('#nav').hidden = true;
+  $('#view').innerHTML = `<div class="empty" style="padding-top:60px">
+    <div style="font-size:42px">🔒</div>
+    <h2>Подпишитесь на канал</h2>
+    <p class="muted">Чтобы пользоваться аукционом, нужно быть подписанным на наш канал: там публикуются все лоты.</p>
+    <button class="btn" id="subGo" style="margin-top:14px">📣 Подписаться</button>
+    <button class="btn sec" id="subCheck" style="margin-top:8px">Я подписался(ась)</button></div>`;
+  $('#subGo').onclick = () => { const u = 'https://t.me/' + S.cfg.channel; if (tg?.openTelegramLink) tg.openTelegramLink(u); else window.open(u, '_blank'); };
+  $('#subCheck').onclick = () => location.reload();
+}
 (async function init() {
   try {
     const [cfg, me] = await Promise.all([fetch('/api/config').then((r) => r.json()), api('/me')]);
     S.cfg = cfg;
     S.me = me;
     document.title = cfg.shopName;
+    if (!me.subscribed) return showGate();
     $('#nav button[data-tab="admin"]').hidden = !me.isAdmin;
-    render();
+    await render();
+    const sp = tg?.initDataUnsafe?.start_param || '';
+    const m = /^lot_(\d+)$/.exec(sp) || /^lot_(\d+)$/.exec(new URLSearchParams(location.search).get('startapp') || '') ;
+    const lot = m ? Number(m[1]) : Number(new URLSearchParams(location.search).get('lot'));
+    if (lot) openLot(lot).catch((e) => toast(e.message));
+    try { if (tg?.requestWriteAccess && !localStorage.getItem('wa')) { localStorage.setItem('wa', '1'); tg.requestWriteAccess(() => {}); } } catch {}
   } catch (err) {
+    if (err.message === 'not_subscribed') return showGate();
     $('#view').innerHTML = `<div class="empty">Откройте аукцион через Telegram-бота.<br><small>${esc(err.message)}</small></div>`;
   }
 })();
