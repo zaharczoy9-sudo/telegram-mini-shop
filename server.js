@@ -18,7 +18,8 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).
 const SHOP_NAME = process.env.SHOP_NAME || 'LOT24';
 const CHANNEL = (process.env.CHANNEL || '').trim().replace(/^https?:\/\/t\.me\//, '').replace(/^@/, '');
 // куда постить новые лоты: числовой CHANNEL_ID (для приватных каналов) или @username из CHANNEL
-const CHANNEL_CHAT = process.env.CHANNEL_ID ? Number(process.env.CHANNEL_ID) : CHANNEL ? '@' + CHANNEL : null;
+// id канала запоминается в БД (когда бот добавлен админом / командой /setchannel), иначе берём CHANNEL_ID или @CHANNEL
+let channelChat = process.env.CHANNEL_ID ? Number(process.env.CHANNEL_ID) : CHANNEL ? '@' + CHANNEL : null;
 const POST_TO_CHANNEL = process.env.POST_TO_CHANNEL !== 'false';
 const APP_SHORT_NAME = (process.env.APP_SHORT_NAME || '').trim(); // короткое имя Mini App из BotFather (необязательно)
 const DEV_USER_ID = process.env.DEV_USER_ID ? Number(process.env.DEV_USER_ID) : null;
@@ -182,12 +183,12 @@ function validateInitData(initData) {
 const REQUIRE_SUB = process.env.REQUIRE_SUBSCRIPTION !== 'false';
 const subCache = new Map(); // userId -> { ok, at }
 async function isSubscribed(userId) {
-  if (!REQUIRE_SUB || !CHANNEL_CHAT || !bot) return true;
+  if (!REQUIRE_SUB || !channelChat || !bot) return true;
   if (ADMIN_IDS.includes(Number(userId))) return true;
   const c = subCache.get(userId);
   if (c && Date.now() - c.at < (c.ok ? 5 * 60 * 1000 : 3 * 1000)) return c.ok;
   try {
-    const m = await bot.api.getChatMember(CHANNEL_CHAT, userId);
+    const m = await bot.api.getChatMember(channelChat, userId);
     const ok = ['creator', 'administrator', 'member'].includes(m.status) || (m.status === 'restricted' && m.is_member);
     subCache.set(userId, { ok, at: Date.now() });
     return ok;
@@ -269,8 +270,15 @@ function lotCaption(a, extra = '') {
 }
 
 // ---------- канал ----------
-async function postLotToChannel(a) {
-  if (!bot || !CHANNEL_CHAT || !POST_TO_CHANNEL) return;
+const chatErrHint = (msg) =>
+  /chat not found/i.test(msg)
+    ? 'Канал не найден. Проверьте переменную CHANNEL (username канала, без @ и без ссылки; у приватного канала username нет — тогда задайте CHANNEL_ID) и добавьте бота в канал администратором. Быстрый способ: отправьте боту /setchannel @username_канала'
+    : /not enough rights|administrator|forbidden/i.test(msg)
+      ? 'У бота нет прав: сделайте его администратором канала с правом публикации сообщений.'
+      : '';
+
+async function postLotToChannel(a, { warn = true } = {}) {
+  if (!bot || !channelChat || !POST_TO_CHANNEL) return { ok: false, error: 'Канал не настроен (переменная CHANNEL или /setchannel)' };
   try {
     const link = lotLink(a.id);
     const kb = new InlineKeyboard();
@@ -279,13 +287,33 @@ async function postLotToChannel(a) {
     const photo = await lotPhoto(a);
     const opts = { caption, parse_mode: 'HTML', ...(link ? { reply_markup: kb } : {}) };
     const msg = photo
-      ? await bot.api.sendPhoto(CHANNEL_CHAT, photo, opts)
-      : await bot.api.sendMessage(CHANNEL_CHAT, caption, { parse_mode: 'HTML', ...(link ? { reply_markup: kb } : {}) });
-    await q('UPDATE auctions SET channel_chat=$2, channel_msg_id=$3 WHERE id=$1', [a.id, String(CHANNEL_CHAT), msg.message_id]);
+      ? await bot.api.sendPhoto(channelChat, photo, opts)
+      : await bot.api.sendMessage(channelChat, caption, { parse_mode: 'HTML', ...(link ? { reply_markup: kb } : {}) });
+    await q('UPDATE auctions SET channel_chat=$2, channel_msg_id=$3 WHERE id=$1', [a.id, String(msg.chat?.id ?? channelChat), msg.message_id]);
+    return { ok: true };
   } catch (e) {
     console.error('channel post failed', a.id, e.message);
-    notifyAdmins(`⚠️ Не удалось опубликовать лот №${a.id} в канале: ${h(e.message)}\nПроверьте, что бот добавлен в канал как администратор с правом публикации. Повторить: /post ${a.id}`);
+    const hint = chatErrHint(e.message);
+    if (warn) notifyAdmins(`⚠️ Не удалось опубликовать лот №${a.id} в канале: ${h(e.message)}\n${h(hint)}\nПовторить: /post ${a.id}`);
+    return { ok: false, error: hint || e.message };
   }
+}
+
+// репост: старый пост удаляем (если есть) и публикуем заново
+async function repostLot(a) {
+  const oldMsg = a.channel_msg_id, oldChat = a.channel_chat;
+  const r = await postLotToChannel(a, { warn: false });
+  if (r.ok && oldMsg && oldChat) {
+    const chat = /^-?\d+$/.test(oldChat) ? Number(oldChat) : oldChat;
+    await bot?.api.deleteMessage(chat, oldMsg).catch(() => {});
+  }
+  return r;
+}
+
+async function saveChannel(chat) {
+  channelChat = chat.id;
+  await q(`INSERT INTO meta(key,value) VALUES ('channel_id',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(chat.id)]);
+  subCache.clear();
 }
 
 // обновляем пост в канале, когда лот закончился или снят
@@ -315,7 +343,7 @@ async function activate(id, method) {
   const a = rows[0];
   if (a) {
     const link = lotLink(a.id);
-    notify(a.seller_id, `✅ Лот №${a.id} «${h(a.title)}» опубликован.\nТорги идут до ${fmtDate(a.ends_at)}.${CHANNEL_CHAT && POST_TO_CHANNEL ? '\nПост с лотом отправлен в канал.' : ''}${link ? `\n\nСсылка на лот: ${link}` : ''}`, lotKb(a.id));
+    notify(a.seller_id, `✅ Лот №${a.id} «${h(a.title)}» опубликован.\nТорги идут до ${fmtDate(a.ends_at)}.${channelChat && POST_TO_CHANNEL ? '\nПост с лотом отправлен в канал.' : ''}${link ? `\n\nСсылка на лот: ${link}` : ''}`, lotKb(a.id));
     postLotToChannel(a);
   }
   return a;
@@ -726,12 +754,25 @@ app.get('/api/admin/auctions', auth, adminOnly, wrap(async (req, res) => {
   res.json({ now: new Date().toISOString(), items: rows.map((a) => ({ ...mapAuction(a, req.user.id), seller_id: a.seller_id, seller_name: a.seller_name })) });
 }));
 
+app.post('/api/admin/auctions/:id/repost', auth, adminOnly, wrap(async (req, res) => {
+  const { rows } = await q('SELECT * FROM auctions WHERE id=$1', [Number(req.params.id)]);
+  const a = rows[0];
+  if (!a) throw new HttpError(404, 'Лот не найден');
+  if (a.status !== 'active') throw new HttpError(400, 'В канал можно отправить только активный лот');
+  const r = await repostLot(a);
+  res.json(r.ok ? { ok: true } : { ok: false, error: r.error || 'Не удалось отправить в канал' });
+}));
+
 // ---------- bot setup ----------
 async function startBot() {
   if (!BOT_TOKEN) { console.warn('BOT_TOKEN not set, bot disabled (DEV mode)'); return; }
   bot = new Bot(BOT_TOKEN);
   await bot.init();
   botUsername = bot.botInfo.username;
+  if (!process.env.CHANNEL_ID) {
+    const { rows } = await q(`SELECT value FROM meta WHERE key='channel_id'`);
+    if (rows[0]) channelChat = Number(rows[0].value);
+  }
   console.log(`Bot @${botUsername} ready`);
 
   const durationsText = () => DURATIONS.map((d) => `${d.hours === 24 ? '24 часа' : d.hours / 24 + ' дня'} — ${d.stars ? d.stars + ' ⭐' : 'бесплатно'}`).join(' · ');
@@ -779,9 +820,15 @@ async function startBot() {
   }
 
   let welcomePhotoId = null; // кэшируем file_id, чтобы не загружать картинку каждый раз
-  bot.command('start', async (ctx) => {
-    touchUser(ctx.from, true).catch(() => {});
-    const m = /^lot_(\d+)$/.exec(String(ctx.match || '').trim());
+  const subKb = (payload) => {
+    const kb = new InlineKeyboard();
+    if (CHANNEL) kb.url('📣 Подписаться на канал', `https://t.me/${CHANNEL}`).row();
+    return kb.text('✅ Я подписался(ась)', 'checksub:' + (payload || ''));
+  };
+  const subText = () => `🔒 Чтобы пользоваться ${h(SHOP_NAME)}, подпишитесь на наш канал: там публикуются все лоты.\n\nПосле подписки нажмите «Я подписался(ась)».`;
+
+  async function showStart(ctx, payload) {
+    const m = /^lot_(\d+)$/.exec(String(payload || '').trim());
     if (m) {
       try { return await sendLotCard(ctx, Number(m[1])); } catch (e) { console.error('lot card', e.message); }
     }
@@ -794,6 +841,21 @@ async function startBot() {
       console.error('welcome photo', e.message);
       await ctx.reply(welcomeText(), { parse_mode: 'HTML', reply_markup: startKb() });
     }
+  }
+
+  bot.callbackQuery(/^checksub:(.*)$/, async (ctx) => {
+    subCache.delete(ctx.from.id);
+    if (!(await isSubscribed(ctx.from.id))) return ctx.answerCallbackQuery({ text: 'Подписка не найдена. Подпишитесь на канал и нажмите ещё раз.', show_alert: true });
+    await ctx.answerCallbackQuery({ text: 'Спасибо! Добро пожаловать' });
+    await ctx.deleteMessage().catch(() => {});
+    await showStart(ctx, ctx.match[1]);
+  });
+
+  bot.command('start', async (ctx) => {
+    touchUser(ctx.from, true).catch(() => {});
+    const payload = String(ctx.match || '').trim();
+    if (!(await isSubscribed(ctx.from.id))) return ctx.reply(subText(), { parse_mode: 'HTML', reply_markup: subKb(payload) });
+    return showStart(ctx, payload);
   });
 
   bot.command('help', (ctx) => ctx.reply(helpText(), { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }));
@@ -860,13 +922,41 @@ async function startBot() {
     await ctx.reply(`Готово: доставлено ${ok} из ${rows.length}.`);
   }));
 
+  bot.command('setchannel', adminOnlyCmd(async (ctx) => {
+    const arg = String(ctx.match || '').trim().replace(/^https?:\/\/t\.me\//, '');
+    if (!arg) return ctx.reply('Использование: /setchannel @username_канала (или -100… id). Бот должен быть админом канала.');
+    const target = /^-?\d+$/.test(arg) ? Number(arg) : '@' + arg.replace(/^@/, '');
+    let chat;
+    try { chat = await bot.api.getChat(target); } catch (e) { return ctx.reply(`Канал не найден (${e.message}). Для приватного канала используйте числовой id -100…`); }
+    if (chat.type !== 'channel') return ctx.reply('Это не канал.');
+    let status = '?';
+    try { status = (await bot.api.getChatMember(chat.id, bot.botInfo.id)).status; } catch {}
+    await saveChannel(chat);
+    await ctx.reply(`✅ Канал «${chat.title}» сохранён (id ${chat.id}). Статус бота: ${status}${status === 'administrator' ? '' : '\n⚠️ Сделайте бота администратором с правом публикации.'}`);
+  }));
+
+  // бот добавили/сделали админом в канале — запоминаем канал автоматически
+  bot.on('my_chat_member', async (ctx) => {
+    const c = ctx.chat;
+    if (c.type !== 'channel') return;
+    const st = ctx.myChatMember.new_chat_member.status;
+    if (st !== 'administrator') return;
+    if (channelChat && String(channelChat) !== String(c.id) && !(CHANNEL && c.username?.toLowerCase() === CHANNEL.toLowerCase())) return;
+    await saveChannel(c);
+    notifyAdmins(`✅ Бот стал администратором канала «${h(c.title)}». Лоты будут публиковаться сюда.`);
+  });
+  bot.on('channel_post', async (ctx) => {
+    const c = ctx.chat;
+    if (CHANNEL && c.username?.toLowerCase() === CHANNEL.toLowerCase() && String(channelChat) !== String(c.id)) await saveChannel(c);
+  });
+
   bot.command('post', adminOnlyCmd(async (ctx) => {
     const id = Number(String(ctx.match || '').trim());
     if (!id) return ctx.reply('Использование: /post НОМЕР_ЛОТА — повторно отправить лот в канал');
     const { rows } = await q(`SELECT * FROM auctions WHERE id=$1 AND status='active'`, [id]);
     if (!rows[0]) return ctx.reply('Активный лот не найден.');
-    await postLotToChannel(rows[0]);
-    await ctx.reply('Отправлено (если не вышло — придёт предупреждение).');
+    const r = await repostLot(rows[0]);
+    await ctx.reply(r.ok ? '✅ Лот отправлен в канал.' : '❌ ' + r.error);
   }));
 
   // описание бота (видно до нажатия START) и меню команд
@@ -887,7 +977,8 @@ async function startBot() {
       { command: 'stats', description: 'Статистика (админ)' },
       { command: 'backup', description: 'Резервная копия (админ)' },
       { command: 'broadcast', description: 'Рассылка (админ)' },
-      { command: 'post', description: 'Повторить пост в канал (админ)' },
+      { command: 'post', description: 'Лот в канал (админ)' },
+      { command: 'setchannel', description: 'Указать канал (админ)' },
     ], { scope: { type: 'chat', chat_id: id } }).catch(() => {});
   }
 
@@ -940,7 +1031,7 @@ async function startBot() {
   if (WEBAPP_URL) {
     bot.api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'Аукцион', web_app: { url: WEBAPP_URL } } }).catch((e) => console.error('menu button', e.message));
   }
-  bot.start({ drop_pending_updates: false, allowed_updates: ['message', 'callback_query', 'pre_checkout_query'] }).catch((e) => console.error('bot stopped', e.message));
+  bot.start({ drop_pending_updates: false, allowed_updates: ['message', 'callback_query', 'pre_checkout_query', 'my_chat_member', 'channel_post'] }).catch((e) => console.error('bot stopped', e.message));
 }
 
 await initDb();
