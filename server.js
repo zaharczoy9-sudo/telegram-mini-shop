@@ -369,6 +369,32 @@ async function finishAuctions() {
   }
 }
 
+// пост «скоро конец» в канал и рассылка всем подписчикам бота
+async function announceEnding(a, alreadyNotified) {
+  const left = leftHuman(new Date(a.ends_at) - Date.now());
+  const link = lotLink(a.id);
+  const text = `🔥 <b>Аукцион скоро закончится!</b>\n\n🔨 <b>${h(a.title)}</b>\n📏 ${h(a.size)} · 📍 ${h(a.city)}\n\n💵 Сейчас: <b>${fmt(a.current_price)} BYN</b>${a.bids_count ? ` · ставок: ${a.bids_count}` : ' · ставок пока нет'}\n⏳ Осталось: ~${left}\n\n⚡ Ещё можно перебить цену — успейте!`;
+  const kb = new InlineKeyboard();
+  if (link) kb.url('🔨 Перебить ставку', link);
+  const markup = link ? { reply_markup: kb } : {};
+  if (bot && channelChat && POST_TO_CHANNEL) {
+    try {
+      const reply = a.channel_msg_id && String(a.channel_chat) === String(channelChat)
+        ? { reply_parameters: { message_id: a.channel_msg_id, allow_sending_without_reply: true } } : {};
+      const photo = await lotPhoto(a);
+      if (photo) await bot.api.sendPhoto(channelChat, photo, { caption: text, parse_mode: 'HTML', ...markup, ...reply });
+      else await bot.api.sendMessage(channelChat, text, { parse_mode: 'HTML', ...markup, ...reply });
+    } catch (e) { console.error('ending channel post', a.id, e.message); }
+  }
+  const { rows } = await q('SELECT user_id FROM users WHERE notify AND NOT blocked AND user_id <> $1', [a.seller_id]);
+  for (const r of rows) {
+    const uid = Number(r.user_id);
+    if (alreadyNotified.has(uid)) continue;
+    await notify(uid, text, markup);
+    await sleep(50);
+  }
+}
+
 // напоминания участникам: за час и за 15 минут до конца
 async function remindEnding() {
   if (!bot) return;
@@ -398,6 +424,7 @@ async function remindEnding() {
         await sleep(50);
       }
       if (col === 'notified_1h') {
+        await announceEnding(a, new Set(ids)).catch((e) => console.error('announceEnding', e.message));
         await notify(a.seller_id, `⏰ Ваш лот «${h(a.title)}» закончится через час. Сейчас ${fmt(a.current_price)} BYN, ставок: ${a.bids_count}.`, lotKb(a.id));
       }
     }
