@@ -381,7 +381,7 @@ function drawLotDyn(dyn, state, refresh) {
   dyn.querySelector('#repostBtn')?.addEventListener('click', async (ev) => {
     if (!(await confirmBox('Отправить лот в канал? Прошлый пост будет заменён.'))) return;
     ev.target.disabled = true;
-    try { await api(`/admin/auctions/${a.id}/repost`, 'POST'); toast('Лот отправлен в канал'); } catch (err) { toast(err.message); }
+    try { const r = await api(`/admin/auctions/${a.id}/repost`, 'POST'); if (r.ok === false) throw new Error(r.error); toast('Лот отправлен в канал'); } catch (err) { toast(err.message); }
     ev.target.disabled = false;
   });
   dyn.querySelector('#payBtn')?.addEventListener('click', () => paySheet(a));
@@ -568,7 +568,7 @@ async function viewAdmin() {
     if (kind === 'del' && !(await confirmBox('Снять лот?'))) return;
     try {
       if (kind === 'del') await api('/auctions/' + id, 'DELETE');
-      else { await api(`/admin/auctions/${id}/${kind}`, 'POST'); toast('Лот отправлен в канал'); }
+      else { const r = await api(`/admin/auctions/${id}/${kind}`, 'POST'); if (r.ok === false) throw new Error(r.error); toast('Лот отправлен в канал'); }
       viewAdmin();
     } catch (err) {
       toast(err.message);
