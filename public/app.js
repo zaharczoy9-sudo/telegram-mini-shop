@@ -239,10 +239,57 @@ document.addEventListener('click', async (e) => {
 });
 
 // ---------- lot sheet ----------
+const maskName = (n) => {
+  const t = [...String(n || '').trim()];
+  if (!t.length) return 'Участник';
+  return t.length <= 2 ? t[0] + '•••' : t[0] + '•••' + t[t.length - 1];
+};
+function soldHtml(data) {
+  const a = data.item, bids = data.bids;
+  const hrs = a.started_at ? Math.max(1, Math.round((Date.parse(a.ends_at) - Date.parse(a.started_at)) / 3600000)) : a.duration_hours;
+  const up = a.start_price > 0 ? Math.round((a.current_price / a.start_price - 1) * 100) : 0;
+  const top = bids.slice(0, 4);
+  return `<div class="sold">
+    <div class="sold-ph" style="background-image:url('${esc(a.images[0] || '')}')">
+      <img src="${esc(a.images[0] || '')}" alt="">
+      <span class="stamp">АУКЦИОН ЗАВЕРШЁН</span>
+      <div class="sold-fade"></div>
+    </div>
+    <h2 class="sold-title">${esc(a.title)}</h2>
+    <div class="sold-price">
+      <div class="sp-lbl">Итоговая цена</div>
+      <div class="sp-val">${byn(a.current_price)}</div>
+      <div class="sp-sub">старт ${byn(a.start_price)}${up > 0 ? ` · <b>+${up}%</b>` : ''}</div>
+    </div>
+    <div class="sold-stats">
+      <div><b>${a.bids_count}</b><span>${plural(a.bids_count, ['ставка', 'ставки', 'ставок'])}</span></div>
+      <div><b>${hrs} ч</b><span>торги</span></div>
+      <div><b>${esc(a.size)}</b><span>размер</span></div>
+    </div>
+    <div class="sold-bids">${top.map((b, i) => `<div class="sb ${i === 0 ? 'win' : ''}"><span>${i === 0 ? '🏆 ' : ''}${esc(maskName(b.user_name))} <small>${ago(b.created_at)}</small></span><b>${byn(b.amount)}</b></div>`).join('')}</div>
+    ${a.contact ? `<div class="muted" style="margin:10px 2px">Контакт владельца: <b>${contactHtml(a.contact)}</b> · ${esc(a.city)}</div>` : ''}
+    <button class="btn" id="soldGo">🔨 Хочу так же — выставить лот</button>
+    <button class="btn sec" id="soldAll" style="margin-top:8px">Смотреть живые торги</button>
+    ${S.me?.isAdmin ? '<button class="btn danger" id="delBtn" style="margin-top:8px;opacity:.6">Снять лот (админ)</button>' : ''}
+  </div>`;
+}
+
 async function openLot(id) {
   const data = await api('/auctions/' + id);
   syncTime(data.now);
   const a0 = data.item;
+  if (a0.status === 'ended' && a0.bids_count > 0) {
+    sheet(soldHtml(data), (el) => {
+      el.classList.add('sold-sheet');
+      el.querySelector('#soldGo').onclick = () => { closeSheet(); S.tab = 'create'; render(); };
+      el.querySelector('#soldAll').onclick = () => { closeSheet(); S.tab = 'catalog'; render(); };
+      el.querySelector('#delBtn')?.addEventListener('click', async () => {
+        if (!(await confirmBox('Снять лот с торгов?'))) return;
+        try { await api('/auctions/' + a0.id, 'DELETE'); closeSheet(); render(); } catch (err) { toast(err.message); }
+      });
+    });
+    return;
+  }
   sheet(
     `${a0.images.length ? `<div class="gallery">${a0.images.map((i) => `<img src="${i}" alt="">`).join('')}</div>` : ''}
      <h2>${esc(a0.title)}</h2>
