@@ -204,7 +204,8 @@ async function auth(req, res, next) {
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   req.user = user;
   req.isAdmin = ADMIN_IDS.includes(Number(user.id));
-  req.displayName = clean(user.first_name || user.username || 'Участник', 40);
+  const dn = clean([user.first_name, user.last_name].filter(Boolean).join(' '), 40);
+  req.displayName = /[\p{L}\p{N}]/u.test(dn) ? dn : clean(user.username, 40) || 'Участник';
   if (!req.originalUrl.startsWith('/api/me') && !(await isSubscribed(user.id))) {
     return res.status(403).json({ error: 'not_subscribed' });
   }
@@ -538,13 +539,13 @@ app.get('/api/me', auth, wrap(async (req, res) => {
 }));
 
 // ---------- auctions: read ----------
-const mapAuction = (a, userId) => ({
+const mapAuction = (a, userId, isAdmin = false) => ({
   id: a.id,
   title: a.title,
   description: a.description,
   size: a.size,
   city: a.city,
-  contact: a.contact,
+  contact: a.status === 'active' || Number(a.seller_id) === Number(userId) || (a.leader_id != null && Number(a.leader_id) === Number(userId)) || isAdmin ? a.contact : '',
   image_ids: a.image_ids,
   images: a.image_ids.map((i) => `/img/${i}`),
   start_price: a.start_price,
@@ -557,6 +558,7 @@ const mapAuction = (a, userId) => ({
   duration_hours: a.duration_hours,
   stars: priceOf(a.duration_hours),
   ends_at: a.ends_at,
+  started_at: a.started_at,
   created_at: a.created_at,
   link: lotLink(a.id),
   mine: Number(a.seller_id) === Number(userId),
@@ -604,7 +606,7 @@ app.get('/api/auctions/:id', auth, wrap(async (req, res) => {
   const mine = Number(a.seller_id) === Number(req.user.id);
   if (!['active', 'ended'].includes(a.status) && !mine && !req.isAdmin) throw new HttpError(404, 'Лот не найден');
   const { rows: bids } = await q('SELECT user_name, amount, created_at FROM bids WHERE auction_id=$1 ORDER BY id DESC LIMIT 20', [id]);
-  res.json({ now: new Date().toISOString(), item: mapAuction(a, req.user.id), bids });
+  res.json({ now: new Date().toISOString(), item: mapAuction(a, req.user.id, req.isAdmin), bids });
 }));
 
 // ---------- favorites ----------
@@ -778,7 +780,7 @@ app.get('/api/admin/auctions', auth, adminOnly, wrap(async (req, res) => {
     `SELECT a.* FROM auctions a WHERE ($1::text IS NULL OR a.status=$1) AND a.status <> 'draft' ORDER BY a.id DESC LIMIT 100`,
     [status || null]
   );
-  res.json({ now: new Date().toISOString(), items: rows.map((a) => ({ ...mapAuction(a, req.user.id), seller_id: a.seller_id, seller_name: a.seller_name })) });
+  res.json({ now: new Date().toISOString(), items: rows.map((a) => ({ ...mapAuction(a, req.user.id, true), seller_id: a.seller_id, seller_name: a.seller_name })) });
 }));
 
 app.post('/api/admin/auctions/:id/repost', auth, adminOnly, wrap(async (req, res) => {
